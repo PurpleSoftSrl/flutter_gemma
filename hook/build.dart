@@ -50,7 +50,7 @@ class _NativeBundle {
   /// Companions to skip on a specific OS. LiteRT skips Apple companion
   /// dylibs on macOS because of a Native Assets install_name_tool slack
   /// issue (#247) — the Podfile post_install handles them instead.
-  final Set<OS> skipCompanionsOn;
+  final List<OS> skipCompanionsOn;
 
   /// Additional libraries to register on Windows only (no `lib` prefix).
   /// LiteRT: lib-prefixed copies for PE imports + DXC runtime + Intel NPU
@@ -76,7 +76,7 @@ class _NativeBundle {
     required this.mainLibName,
     required this.markerFileName,
     this.companions = const [],
-    this.skipCompanionsOn = const {},
+    this.skipCompanionsOn = const [],
     this.windowsExtraLibs = const [],
     this.useFlatLayout = false,
   });
@@ -190,7 +190,7 @@ const _litertlmBundle = _NativeBundle(
   // framework path. iOS / Linux / Windows / Android are unaffected: their
   // Native Assets paths (Xcode build phases on iOS, no install_name_tool
   // on Linux/Windows/Android) don't trigger the bug.
-  skipCompanionsOn: {OS.macOS},
+  skipCompanionsOn: [OS.macOS],
   // Windows: LiteRtLm.dll references companion DLLs by their original
   // Google filenames with "lib" prefix (libLiteRt.dll etc.) via PE imports.
   // Native Assets uses no prefix on Windows (LiteRt.dll), so we ship both
