@@ -1,0 +1,1937 @@
+author: Sasha Denisov
+summary: Hybrid AI in Flutter with Genkit Dart — From Cloud to On-Device
+id: hybrid-ai-flutter-genkit
+categories: flutter, ai, gemma, genkit
+environments: android, ios, macos, windows, linux, web
+status: Published
+
+# Hybrid AI in Flutter: From Cloud to On-Device with Genkit Dart
+
+## Overview
+Duration: 7
+
+### What you'll build
+
+**An offline travel guide.** You are abroad, roaming is expensive or missing
+entirely, and you still want to ask "what should I see in Prague?" That is the
+reason this app is hybrid rather than one more chat with Gemini — the phone has
+to be able to answer on its own.
+
+It is a single screen: a chat that streams its replies. Everything else on that
+screen exists to make *where the answer came from* visible.
+
+- A **policy picker** — Cloud, Local, Smart (image-aware), Cascade (escalate on
+  quality), Budget (cost-gated). The conversation and its history never change;
+  only the brain behind them does.
+- A **RAG toggle**. Off, the model answers from memory. On, your question is
+  embedded **on the phone** and matched against ten city guides shipped inside
+  the app — Paris, Tokyo, Barcelona, Istanbul, Marrakech, New York, Prague,
+  Rio, Singapore, Sydney. A `Sources: Paris` banner under the policy picker is
+  the only place you can see that the answer was grounded in a guide rather
+  than invented.
+- **Image attachment** — a photo goes to the cloud, the only target that
+  declares vision; on the text-only policies the send is blocked with a hint.
+- A **budget** policy that spends three cloud calls, then quietly drops to the
+  device. The app counts those calls in code; the screen does not show the
+  count.
+
+### The finished app in 30 seconds
+
+When you reach the end, this is the demo — worth reading now, so you know what
+you are building toward:
+
+1. On **Cloud**, ask "what should I see in Paris?" — an ordinary cloud answer,
+   tokens streaming in.
+2. Turn **RAG** on and ask the same question: a `Sources: Paris` banner
+   appears, and the answer now leans on the bundled guide instead of the
+   model's memory.
+3. Switch to **Local** and turn off wi-fi. The phone answers. This is the moment
+   the whole codelab exists for.
+4. Turn wi-fi back on and attach a photo while still on **Local** — the send is
+   blocked with a hint. Switch to **Smart** and the same photo goes to the
+   cloud.
+5. Select **Budget** and keep sending. Cloud and Budget share one count of
+   cloud calls, capped at three, and the two Cloud questions above already
+   used two of them: the next answer still comes from the cloud, and after
+   that they quietly arrive from the device.
+
+### How we get there
+
+Six increments, each a directory you can open and run:
+
+1. **Cloud Chat** — Streaming responses from Gemini via `genkit_google_genai`
+2. **Local Inference** — On-device AI with Gemma 3 1B via `genkit_flutter_edge_ai`
+3. **Hybrid Strategy** — one `genkit_hybrid` router over cloud and device (rules, fallback, capability, cascade, budget)
+4. **Smart Routing & Images** — multimodal input and image-aware policy routing
+5. **Embeddings** — Semantic vector representations with EmbeddingGemma via Genkit
+6. **RAG** — Context-augmented generation using a local tourist guide
+
+### What you'll learn
+
+- How to use the Genkit Dart framework for AI inference in Flutter
+- How to route between cloud and on-device models with a `genkit_hybrid`
+  router that decides once per message, and keeps the cloud out of reach of
+  any call that skips it
+- How to run AI models locally on device with `genkit_flutter_edge_ai`
+- How to send images to a vision-capable model and gate routing on model
+  capabilities
+- How text embeddings work and how to build a RAG pipeline with Genkit
+
+### What you'll need
+
+- Flutter 3.44 or newer
+- A GEMINI_API_KEY from [aistudio.google.com](https://aistudio.google.com)
+- A HuggingFace account (for model downloads)
+- Any one of Flutter's six platforms: an arm64 Android device or emulator
+  (libLiteRtLm is arm64-only — an Apple-silicon Mac's emulator qualifies), an
+  iOS device or simulator, an Apple-silicon Mac, a Windows or Linux desktop, or
+  Chrome. The same code runs on all of them through Step 4 — Step 3 lists the
+  handful of things each one asks of you — including Step 5's embeddings and
+  the RAG Step 6 builds on them, which run on Chrome too
+- ~1 GB free disk space for the on-device LLM plus EmbeddingGemma on native;
+  on web the LLM alone is a 2.0 GB build (Step 3 explains why it's a
+  different, larger model there), plus EmbeddingGemma on top
+
+### Architecture
+
+```
+┌──────────────────────────────────────────┐
+│              Flutter App                 │
+├──────────────────────────────────────────┤
+│                AiEngine                  │
+│   the app's Genkit + one hybrid router   │
+├──────────────────┬───────────────────────┤
+│ router's own     │  app's Genkit:        │
+│ googleAI plugin  │  GenkitFlutterEdgeAi  │
+│ gemini-3.7-flash │  Gemma 3 1B +         │
+│     (kCloud)     │  EmbeddingGemma       │
+│                  │    (kOnDevice)        │
+└──────────────────┴───────────────────────┘
+```
+
+On the web, `kOnDevice` is a different, larger model — Gemma 3 1B has no
+`.litertlm` browser build, so `AiEngine` installs Gemma 4 E2B's web export
+instead. Step 3 covers why. EmbeddingGemma is part of that plugin on every
+platform, the web included — Step 5 lists the four files a browser needs for it.
+
+`genkit_hybrid` puts one router in front of both targets. The router holds a
+policy per `PolicyMode` — cloud, local, smart, cascade, budget — and decides
+where each message runs, once, before the model is called.
+
+The key insight: the app's `Genkit` gets the on-device plugin only. The Gemini
+plugin is handed to the router, which keeps it in a Genkit of its own, so the
+cloud is reachable only through the router: a call that forgets it has nowhere
+to go. The chat screen always calls the same
+`engine.router.generateStream(policy: ..., messages: [...])`; only the policy
+name changes, and the result says where the answer came from
+(`result.route`).
+
+## Step 1: Starter Project
+Duration: 5
+
+### Get the code
+
+Every step of this codelab exists as a complete, runnable app, so you can join
+at any point or check your work against the next one.
+
+```bash
+git clone --depth 1 https://github.com/DenisovAV/flutter_edge_ai.git
+cd flutter_edge_ai/codelabs/hybrid-ai-flutter-genkit
+ls
+```
+
+```text
+step_00_starter/         the shell you start from
+step_01_cloud_ai/        after Step 2 — Gemini, streaming
+step_02_local_ai/        after Step 3 — Gemma 3 1B on the device
+step_03_hybrid/          after Step 4 — one AiEngine, one router
+step_04_smart_routing/   after Step 4.5 — images and the routing policies
+step_05_embeddings/      after Step 5 — on-device embeddings
+complete/                after Step 6 — the finished app, with RAG
+```
+
+### Explore the project
+
+Open `step_00_starter` in your IDE and run `flutter pub get`. The starter
+includes:
+
+- **`lib/main.dart`** — Simple app entry point, no async setup needed
+- **`lib/screens/chat_screen.dart`** — Chat UI with TextField, ListView, send button
+- **`lib/widgets/message_bubble.dart`** — Styled message bubbles (user right, AI left)
+- **`lib/models/message_model.dart`** — Simple `ChatMessage` data class
+- **`lib/services/ai_service.dart`** — Abstract `AIService` interface
+- **`assets/tourist_data/`** — 10 JSON files with city descriptions (Paris, Tokyo, New York…)
+
+### The AIService interface
+
+All our AI services implement this contract:
+
+```dart
+abstract class AIService {
+  Future<void> initialize();
+  Stream<String> generateResponseStream(String prompt);
+  Future<void> dispose();
+}
+```
+
+`generateResponseStream` returns a `Stream<String>` — responses stream
+token-by-token for a real-time chat feel.
+
+### Run the starter
+
+```bash
+cd step_00_starter
+flutter run
+```
+
+You'll see the chat UI. Messages echo back with a placeholder. Let's replace
+that with real AI next.
+
+## Step 2: Cloud Chat with Genkit
+Duration: 15
+
+### Get your API key
+
+Go to [aistudio.google.com](https://aistudio.google.com), sign in with your
+Google account, and click **Get API key**. Copy the key — you'll use it with
+`--dart-define`.
+
+> No Firebase project, no CLI setup — just an API key.
+
+> **Model choice**: this workshop pins `gemini-3.7-flash` — Gemini 2.5 Flash
+> no longer answers on the Gemini API.
+
+### Update dependencies
+
+In `pubspec.yaml`, uncomment the Genkit dependencies:
+
+```yaml
+dependencies:
+  flutter:
+    sdk: flutter
+  material_ui: ^1.1.0
+  cupertino_icons: ^1.0.8
+
+  # Step 2: Cloud AI
+  genkit: ^1.0.0
+  genkit_google_genai: ^1.0.0
+```
+
+Run `flutter pub get`.
+
+### Create CloudAIService
+
+Create `lib/services/cloud_ai_service.dart`:
+
+```dart
+import 'package:genkit/genkit.dart';
+import 'package:genkit_google_genai/genkit_google_genai.dart';
+
+import 'ai_service.dart';
+
+// Pass at build time: flutter run --dart-define=GEMINI_API_KEY=AIza...
+const String _apiKey = String.fromEnvironment('GEMINI_API_KEY');
+
+class CloudAIService implements AIService {
+  Genkit? _ai;
+
+  @override
+  Future<void> initialize() async {
+    if (_apiKey.isEmpty) {
+      throw StateError(
+        'GEMINI_API_KEY is not set. '
+        'Run with --dart-define=GEMINI_API_KEY=your_key',
+      );
+    }
+    _ai = Genkit(plugins: [googleAI(apiKey: _apiKey)]);
+  }
+
+  @override
+  Stream<String> generateResponseStream(String prompt) async* {
+    final ai = _ai;
+    if (ai == null) throw StateError('CloudAIService not initialized');
+
+    final stream = ai.generateStream(
+      model: googleAI.gemini('gemini-3.7-flash'),
+      prompt: prompt,
+    );
+
+    await for (final chunk in stream) {
+      if (chunk.text.isNotEmpty) yield chunk.text;
+    }
+    // genkit 1.0 ends the stream normally when the model fails or the
+    // reply is blocked, and reports it in the result, so rethrow it for the caller.
+    final result = await stream.onResult;
+    final reason = result.finishReason;
+    if (reason != FinishReason.stop &&
+        reason != FinishReason.length &&
+        reason != FinishReason.unknown) {
+      throw result.cause ??
+          StateError(result.finishMessage ?? 'The model stopped: $reason');
+    }
+  }
+
+  @override
+  Future<void> dispose() async {
+    _ai = null;
+  }
+}
+```
+
+The check after the loop matters: in genkit 1.0 a model error does not throw
+out of `generateStream`. The stream ends normally and the outcome arrives in
+`onResult`: `FinishReason.failed` for an error, `blocked` when Gemini's safety
+filters stop the reply. Treating anything but `stop`, `length` or `unknown` as
+an error, and rethrowing its `cause` or its `finishMessage`, is what lets the
+chat screen show it instead of an empty reply.
+
+### Wire it up in chat_screen.dart
+
+Replace the echo stub:
+
+```dart
+import '../services/cloud_ai_service.dart';
+
+// in _ChatScreenState:
+late final CloudAIService _service;
+
+// in initState:
+_service = CloudAIService();
+_initService();
+
+// in _initService:
+await _service.initialize();
+
+// in _sendMessage:
+await for (final chunk in _service.generateResponseStream(text)) {
+  buffer.write(chunk);
+  // ... the throttled setState loop, then _scrollToBottom()
+}
+```
+
+### Let Android reach the network
+
+The Gemini call is an ordinary HTTPS request, and on Android an app gets no
+network unless its manifest asks. Debug builds hide this — Flutter's
+`android/app/src/debug/AndroidManifest.xml` grants `INTERNET` so the tooling
+can talk to the app — so a missing line only shows up in a release build. Add
+it to `android/app/src/main/AndroidManifest.xml`, above `<application>`:
+
+```xml
+    <uses-permission android:name="android.permission.INTERNET" />
+```
+
+`step_01_cloud_ai` already has it. On macOS the sandbox's equivalent,
+`com.apple.security.network.client`, is already in the starter's entitlements.
+
+### Run with your API key
+
+```bash
+flutter run --dart-define=GEMINI_API_KEY=your_key_here
+```
+
+Type "Tell me about Paris" — Gemini streams a response token by token.
+
+> **What happened?** `Genkit(plugins: [googleAI(...)])` registered Gemini as a
+> model provider. `ai.generateStream(model: googleAI.gemini('gemini-3.7-flash'), ...)`
+> streams the response. The `Genkit` instance is the single point of contact
+> for all AI operations.
+
+## Step 3: Local Inference with genkit_flutter_edge_ai
+Duration: 20
+
+### Platform setup
+
+This step holds nearly all of the platform configuration — Step 2's network
+permission and Step 4.5's file-picker entitlement are the only other pieces —
+and it is less than you would expect on any of the six. Read the subsection for the platform you
+are running on and skip the others. [Getting Started](/codelabs/getting-started-flutter-gemma)
+covers each of them at length in its Step 2; what follows is what *this* app
+needs.
+
+**Android** — the `INTERNET` permission you added in Step 2 already covers the
+model download. What is new is the API floor in `android/app/build.gradle.kts`,
+because the on-device half of the app loads `libLiteRtLm.so`:
+
+```kotlin
+defaultConfig {
+    // …
+    // libLiteRtLm.so needs API 30+ Bionic (pthread_cond_clockwait,
+    // sem_clockwait). Below 30 the app installs and then fails at the first
+    // model load with a dlopen error.
+    minSdk = 30
+```
+
+**iOS** — a deployment target of 15.0 or newer, and three memory entitlements in
+`ios/Runner/Runner.entitlements`:
+
+```xml
+	<key>com.apple.developer.kernel.extended-virtual-addressing</key>
+	<true/>
+	<key>com.apple.developer.kernel.increased-memory-limit</key>
+	<true/>
+	<key>com.apple.developer.kernel.increased-debugging-memory-limit</key>
+	<true/>
+```
+
+Every step app already ships that file with the Runner target pointed at it, so
+there is nothing to wire up here — in your own project you select it in Xcode's
+**Signing & Capabilities** editor. The keys lift the per-process memory ceiling
+iOS imposes: half a gigabyte of weights plus a KV cache is comfortably over the
+default jetsam limit on an older iPhone, and the kill that follows has no
+Dart-visible error — the app simply disappears.
+
+**macOS** — two entitlements and one build phase. The entitlements go in
+**both** `macos/Runner/DebugProfile.entitlements` and
+`macos/Runner/Release.entitlements`, and every step app from this one on already
+carries them:
+
+```xml
+	<key>com.apple.security.cs.disable-library-validation</key>
+	<true/>
+	<key>com.apple.security.network.client</key>
+	<true/>
+```
+
+`network.client` is what lets a sandboxed macOS app reach Gemini and Hugging
+Face at all. `disable-library-validation` does nothing yet: it matters once
+Hardened Runtime is on, which notarizing the app for distribution requires. The
+build phase below signs the companion libraries ad hoc, and library validation
+refuses code not signed by Apple or by your own team. The iOS keys
+above are deliberately **not** here: they are iOS entitlements. On macOS a build
+with no signing team fails outright with `"Runner" has entitlements that require
+signing with a development certificate`, and a team-signed build silently drops
+them. macOS support is Apple Silicon only.
+
+The build phase is the part unique to macOS. Every step app from this one on
+targets macOS 14.0 (LiteRT-LM's companion libraries are built for it), turns
+Swift Package Manager off in `pubspec.yaml`
+(`flutter: config: enable-swift-package-manager: false`), and ships a
+`macos/Podfile` whose `post_install` block stages those libraries into the
+built `.app`. A macOS build that succeeds proves nothing here — the app
+compiles, links, signs and launches without the staging too, and the failure
+arrives at the first model load. An app of your own can keep Swift Package
+Manager on, Flutter's default since 3.44: from `flutter_edge_ai_litertlm` 1.19.0
+its Swift package brings the libraries, and the app needs only the 14.0
+deployment target and `network.client`.
+
+**Windows** — nothing in the app, and x86_64 only: there is no Windows arm64
+build of the runtime. Nothing needs installing: nothing in the bundle needs a C++
+runtime the machine does not already have.
+
+**Linux** — nothing in the app either. glibc 2.34 and GCC 12's libstdc++ or
+newer, which means Ubuntu 22.04+, Debian 12+ or RHEL 10+; building a Flutter
+Linux app at all also wants `clang cmake ninja-build libgtk-3-dev lld`, and
+`flutter doctor` names whichever of those you are missing.
+
+**Web** — three script tags, plus one line in `initialize()`. The on-device
+arm loads the runtime from a CDN, and that ES module assigns no window
+globals — module scripts are deferred, so Dart would reach the engine before
+the constructor exists. `web/index.html` publishes a promise instead, and
+Dart awaits it. Every step app from this one on carries it in `<head>`:
+
+```html
+<script type="module">
+window.litertLmReady = (async () => {
+  const m = await import('https://cdn.jsdelivr.net/npm/@litert-lm/core@0.18.0/+esm');
+  window.Engine = m.Engine;
+  return m.Engine;
+})();
+</script>
+
+  <!-- Cache API for persistent storage -->
+  <script src="cache_api.js"></script>
+
+  <!-- OPFS Helper for large model streaming (>2GB) -->
+  <script src="opfs_helper.js"></script>
+```
+
+`cache_api.js` and `opfs_helper.js` are copied byte-for-byte from the
+`flutter_edge_ai` package's own `web/` directory — `installModel()` (and, in
+general, `installEmbedder()`) call into them (via `window.cachePut` and
+friends) to put model bytes into browser storage. Without them a web model
+install fails. Copy both files into your app's `web/` directory alongside
+`index.html`. Browser storage is not a permanent install, though: the bytes
+survive a reload, the app's in-memory handle on them does not, so a reloaded
+tab still reports the model installed and fetches it again. From Step 4 on,
+`AiEngine` calls `installEmbedder()` as well — on the web too — so the
+embedding model takes the same path into browser storage.
+
+The matching Dart-side change is `webStorageMode: WebStorageMode.streaming`
+on `FlutterEdgeAi.initialize()`, and size is the reason for it: streaming
+hands `@litert-lm/core` a ReadableStream out of OPFS instead of buffering the
+download into one blob, which browsers cap at roughly 2 GB — Chrome refuses
+past it with `ERR_BLOB_OUT_OF_MEMORY`. Native platforms ignore the option.
+
+The model itself changes on the web, and for a different reason than that
+size limit. `@litert-lm/core` only runs dedicated web builds, and Gemma 3
+1B — the model every native platform uses — has none: installing the native
+file and creating an engine from it fails with
+`Error: Streaming kTfLitePrefillDecode models is not supported yet.` So on
+the web this app installs Gemma 4 E2B's web build instead
+(`gemma-4-E2B-it-web.litertlm`, 2.0 GB — right on the ~2 GB blob limit that
+streaming mode exists to sidestep, which is why streaming earns its keep here
+and never had to on the ~0.6 GB native file), from the same ungated
+`litert-community/gemma-4-E2B-it-litert-lm` repository the
+[Multimodal](/codelabs/multimodal-flutter-gemma) codelab uses — no token
+required for it. `LocalAIService` and `AiEngine` below both switch `_hfRepo`,
+`_hfModelFile`, and the `ModelType` passed to `installModel` and
+`FlutterEdgeAiModelConfig` on `kIsWeb`; native keeps Gemma 3 1B unchanged.
+
+The web arm is an early preview: WebGPU, and text only. That matters for one
+policy in particular — an image on **Smart** still routes to the cloud, which
+is the only target that declares vision anywhere.
+
+### Update dependencies
+
+Add `genkit_flutter_edge_ai` and `flutter_edge_ai`:
+
+```yaml
+  # Step 3: On-device AI (LiteRT-LM engine)
+  genkit_flutter_edge_ai: ^0.12.0
+  flutter_edge_ai: ^2.6.0
+  # flutter_edge_ai registers no engine by default — opt into LiteRT-LM
+  # (.litertlm inference) here.
+  flutter_edge_ai_litertlm: ^1.20.0
+  # Step 5 embeds your documents. The engine above runs the forward pass;
+  # this package supplies the tokenizers it needs.
+  flutter_edge_ai_embeddings: ^2.3.0
+```
+
+Run `flutter pub get`.
+
+### Get a HuggingFace token
+
+Go to [huggingface.co](https://huggingface.co), sign in, and create a
+read-access token at **Settings → Access Tokens**. Native platforms need it from
+this step on, because `litert-community/Gemma3-1B-IT` is gated. On the web this
+step installs Gemma 4 E2B's web build from an ungated repository instead (see
+the Web setup above), so for Step 3 alone the token is optional there — but
+from Step 4 on `AiEngine` also installs EmbeddingGemma from
+`litert-community/embeddinggemma-300m`, which is gated on every platform, the
+web included.
+
+Accept the licence on **both** gated repos —
+[Gemma3-1B-IT](https://huggingface.co/litert-community/Gemma3-1B-IT) and
+[embeddinggemma-300m](https://huggingface.co/litert-community/embeddinggemma-300m)
+— with the account the token belongs to. A token alone is not enough: without
+the accepted licence the download is refused all the same.
+
+### Create LocalAIService
+
+Create `lib/services/local_ai_service.dart`:
+
+```dart
+import 'package:flutter/foundation.dart' show kIsWeb;
+import 'package:flutter_edge_ai/flutter_edge_ai.dart';
+import 'package:flutter_edge_ai_litertlm/flutter_edge_ai_litertlm.dart';
+import 'package:genkit/genkit.dart';
+import 'package:genkit_flutter_edge_ai/genkit_flutter_edge_ai.dart';
+
+import 'ai_service.dart';
+
+// The on-device LLM installs straight from Hugging Face by repo + file. The
+// browser engine only runs dedicated web builds — Gemma 3 1B has none — so on
+// web this installs Gemma 4 E2B's public web build instead (~2.0 GB, vs
+// ~0.6 GB for the gated native file).
+const String _hfRepo = kIsWeb
+    ? 'litert-community/gemma-4-E2B-it-litert-lm'
+    : 'litert-community/Gemma3-1B-IT';
+const String _hfModelFile = kIsWeb
+    ? 'gemma-4-E2B-it-web.litertlm'
+    : 'Gemma3-1B-IT_multi-prefill-seq_q4_ekv4096.litertlm';
+const ModelType _modelType = kIsWeb ? ModelType.gemma4 : ModelType.gemmaIt;
+
+// Pass at build time: flutter run --dart-define=HF_TOKEN=hf_xxx
+const String _hfToken = String.fromEnvironment('HF_TOKEN');
+
+const String _modelName = 'gemma-3-1b-it';
+const String _embedderName = 'embedding-gemma-300m';
+
+class LocalAIService implements AIService {
+  Genkit? _ai;
+  bool _isInitialized = false;
+
+  bool get isInitialized => _isInitialized;
+
+  // Shared Genkit instance exposed for RagService to use for embeddings.
+  Genkit get ai {
+    final ai = _ai;
+    if (ai == null) throw StateError('LocalAIService not initialized');
+    return ai;
+  }
+
+  String get embedderName => _embedderName;
+
+  @override
+  Future<void> initialize({void Function(int)? onProgress}) async {
+    if (_isInitialized) return;
+
+    // flutter_edge_ai registers no engine by default — opt into LiteRT-LM.
+    // `webStorageMode: streaming` (OPFS-backed) is what the size demands: the
+    // 2.0 GB web build sits right on the ~2 GB blob ceiling the default
+    // cacheApi mode would have to buffer it into, so the @litert-lm/core
+    // engine reads it from OPFS as a ReadableStream. Ignored on non-web.
+    await FlutterEdgeAi.initialize(
+      webStorageMode: WebStorageMode.streaming,
+      inferenceEngines: [LiteRtLmEngine()],
+    );
+
+    // Download the .litertlm model (skipped if already installed).
+    await FlutterEdgeAi.installModel(
+          modelType: _modelType,
+          fileType: ModelFileType.litertlm,
+        )
+        .fromHuggingFace(
+          _hfRepo,
+          file: _hfModelFile,
+          token: _hfToken.isEmpty ? null : _hfToken,
+        )
+        .withProgress((p) => onProgress?.call(p)) // p is int 0..100
+        .install();
+
+    // No installEmbedder() call here: this app never computes an embedding
+    // (RagService doesn't exist until Step 5, by which point this whole
+    // file is retired — see Step 4) and initialize() registers no embedding
+    // backend either, so downloading the ~190 MB model here would just be
+    // wasted bandwidth. embedderName/embedders below stay purely
+    // declarative, ready for Step 4's AiEngine to actually install it.
+
+    // One Genkit instance for both inference and embeddings.
+    _ai = Genkit(
+      plugins: [
+        GenkitFlutterEdgeAiPlugin(
+          models: [
+            FlutterEdgeAiModelConfig(
+              name: _modelName,
+              modelType: _modelType,
+              fileType: ModelFileType.litertlm,
+            ),
+          ],
+          embedders: [FlutterEdgeAiEmbedderConfig(name: _embedderName)],
+        ),
+      ],
+    );
+
+    _isInitialized = true;
+  }
+
+  @override
+  Stream<String> generateResponseStream(String prompt) async* {
+    final stream = ai.generateStream(
+      model: flutterEdgeAi.model(_modelName),
+      prompt: prompt,
+    );
+
+    await for (final chunk in stream) {
+      if (chunk.text.isNotEmpty) yield chunk.text;
+    }
+    // genkit 1.0 ends the stream normally when the model fails or the
+    // reply is blocked, and reports it in the result, so rethrow it for the caller.
+    final result = await stream.onResult;
+    final reason = result.finishReason;
+    if (reason != FinishReason.stop &&
+        reason != FinishReason.length &&
+        reason != FinishReason.unknown) {
+      throw result.cause ??
+          StateError(result.finishMessage ?? 'The model stopped: $reason');
+    }
+  }
+
+  @override
+  Future<void> dispose() async {
+    _ai = null;
+    _isInitialized = false;
+  }
+}
+```
+
+Three things in that file run ahead of this step — the `ai` getter,
+`embedderName`, and the `embedders:` entry in `GenkitFlutterEdgeAiPlugin`.
+They ship here so that the RAG step is a new file and not a second edit of
+this one; ignore them until then. There's no `installEmbedder()` call to run
+ahead of, though: nothing in this app, now or later in its short life,
+computes an embedding, so there's nothing to gain from downloading one.
+Step 4's `AiEngine` installs it for real, once RAG is actually on the way.
+
+### Wire it up in chat_screen.dart
+
+Keep `CloudAIService` and add the new service beside it — `_service` from Step 2
+becomes `_cloudService` — with a Cloud/Local toggle in the app bar to choose
+between them:
+
+```dart
+import '../services/local_ai_service.dart';
+
+// in _ChatScreenState:
+late final CloudAIService _cloudService;
+late final LocalAIService _localService;
+
+bool _useLocal = false;
+
+// in initState:
+_cloudService = CloudAIService();
+_localService = LocalAIService();
+_initServices();
+
+// in _initServices, after the cloud service, in its own try/catch so a
+// failed download never takes the cloud chat down with it:
+await _localService.initialize(
+  onProgress: (progress) {
+    if (mounted) {
+      setState(() => _statusMessage = 'Downloading model: $progress%');
+    }
+  },
+);
+
+// in _sendMessage:
+final service = _useLocal ? _localService : _cloudService;
+await for (final chunk in service.generateResponseStream(text)) {
+  buffer.write(chunk);
+  // ... the throttled setState loop, unchanged
+}
+
+// in build, as the AppBar's `bottom:` (inside a PreferredSize):
+SegmentedButton<bool>(
+  segments: const [
+    ButtonSegment(value: false, label: Text('Cloud'), icon: Icon(Icons.cloud)),
+    ButtonSegment(
+      value: true,
+      label: Text('Local'),
+      icon: Icon(Icons.phone_android),
+    ),
+  ],
+  selected: {_useLocal},
+  onSelectionChanged: (_isGenerating || _isInitializing)
+      ? null
+      : (s) => setState(() => _useLocal = s.first),
+),
+```
+
+`_statusMessage` stops being `final` — the download now writes to it — and
+`dispose()` disposes both services. `step_02_local_ai/lib/screens/chat_screen.dart`
+has the whole file.
+
+### Run with HuggingFace token
+
+```bash
+flutter run --dart-define=GEMINI_API_KEY=your_key --dart-define=HF_TOKEN=hf_xxx
+```
+
+The first run downloads ~550 MB (~2.0 GB on the web, for Gemma 4 E2B instead
+of Gemma 3 1B). Subsequent runs use the cached model.
+
+> **Key insight**: Notice that `generateResponseStream` looks identical to
+> `CloudAIService` — only the `model:` parameter changes. Genkit decouples
+> _what model to use_ from _how to call it_.
+
+```dart
+// Cloud:
+ai.generateStream(model: googleAI.gemini('gemini-3.7-flash'), prompt: prompt)
+
+// Local:
+ai.generateStream(model: flutterEdgeAi.model('gemma-3-1b-it'), prompt: prompt)
+```
+
+Same API. Different backends.
+
+> **Coming up**: In Step 4 we retire `CloudAIService` and `LocalAIService` as
+> separate classes. A single `AiEngine` builds the app's `Genkit` with the
+> on-device plugin and one `genkit_hybrid` router over both targets, which
+> owns the Gemini plugin — the app calls `engine.router.generateStream(...)`
+> and the router picks the model, instead of the app picking a service.
+
+## Step 4: Hybrid Strategy
+Duration: 15
+
+### Update dependencies
+
+Add `genkit_hybrid` — the routing layer. Everything else (the cloud + on-device
+plugins and `flutter_edge_ai_litertlm`) is already in place from Steps 2–3:
+
+```yaml
+  # Hybrid on-device ↔ cloud routing
+  genkit_hybrid: ^0.5.0
+```
+
+Run `flutter pub get`.
+
+### Retire CloudAIService, LocalAIService
+
+```bash
+rm lib/services/ai_service.dart lib/services/cloud_ai_service.dart \
+   lib/services/local_ai_service.dart
+```
+
+They're replaced by one `AiEngine` that owns the app's `Genkit` (the on-device
+plugin) and one `genkit_hybrid` router (which owns the Gemini plugin).
+
+### Create AiEngine
+
+Create `lib/services/ai_engine.dart`:
+
+```dart
+import 'package:flutter/foundation.dart'
+    show debugPrint, kIsWeb, visibleForTesting;
+import 'package:flutter_edge_ai/flutter_edge_ai.dart';
+import 'package:flutter_edge_ai_embeddings/flutter_edge_ai_embeddings.dart';
+import 'package:flutter_edge_ai_litertlm/flutter_edge_ai_litertlm.dart';
+import 'package:genkit/genkit.dart';
+import 'package:genkit_flutter_edge_ai/genkit_flutter_edge_ai.dart';
+import 'package:genkit_google_genai/genkit_google_genai.dart';
+import 'package:genkit_hybrid/genkit_hybrid.dart';
+
+// Prod installs the on-device LLM straight from Hugging Face by repo + file
+// (the plugin applies the configured token to gated huggingface.co URLs). The
+// browser engine only runs dedicated web builds — Gemma 3 1B has none — so on
+// web this installs Gemma 4 E2B's public web build instead (~2.0 GB, vs
+// ~0.6 GB for the gated native file).
+const _hfRepo = kIsWeb
+    ? 'litert-community/gemma-4-E2B-it-litert-lm'
+    : 'litert-community/Gemma3-1B-IT';
+const _hfModelFile = kIsWeb
+    ? 'gemma-4-E2B-it-web.litertlm'
+    : 'Gemma3-1B-IT_multi-prefill-seq_q4_ekv4096.litertlm';
+const _modelType = kIsWeb ? ModelType.gemma4 : ModelType.gemmaIt;
+const _embeddingModelUrl =
+    'https://huggingface.co/litert-community/embeddinggemma-300m/resolve/main/embeddinggemma-300M_seq1024_mixed-precision.tflite';
+const _tokenizerUrl =
+    'https://huggingface.co/litert-community/embeddinggemma-300m/resolve/main/sentencepiece.model';
+
+// Pass at build time: --dart-define=HF_TOKEN=hf_xxx --dart-define=GEMINI_API_KEY=AIza...
+const _hfToken = String.fromEnvironment('HF_TOKEN');
+const _geminiApiKey = String.fromEnvironment('GEMINI_API_KEY');
+
+const kLocalModel = 'gemma-3-1b-it';
+const kCloudModel = 'gemini-3.7-flash';
+const kEmbedder = 'embedding-gemma-300m';
+
+/// Context window for the on-device target, in tokens. `maxTokens` is the
+/// WHOLE window (input + output) and genkit_flutter_edge_ai defaults it to 1024.
+/// RagService's take(3) of ~600-token city guides alone is ~1.7k tokens —
+/// measured on device: "Input token ids are too long … 1713 >= 1024". The
+/// bundled Gemma-3-1B `.litertlm` is built for 4096 (`ekv4096`), so use it.
+const kOnDeviceContextTokens = 4096;
+
+/// The five routing policies the chat exposes. Each is one genkit_hybrid
+/// [RoutePolicy] of the engine's router (see [AiEngine.policyFor]), and
+/// carries the UI facts about itself — its label, which targets it needs,
+/// whether it is text-only — so the screen renders the dropdown from
+/// `PolicyMode.values` instead of restating all five modes by hand.
+enum PolicyMode {
+  cloud('Cloud', needsLocal: false),
+  local('Local', needsCloud: false, textOnly: true),
+  smart('Smart (image-aware)'),
+  cascade('Cascade (escalate on quality)'),
+  budget('Budget (cost-gated)');
+
+  const PolicyMode(
+    this.label, {
+    this.needsCloud = true,
+    this.needsLocal = true,
+    this.textOnly = false,
+  });
+
+  /// Dropdown text.
+  final String label;
+
+  /// Which targets the policy for this mode requires.
+  final bool needsCloud;
+  final bool needsLocal;
+
+  /// True when every route of the policy ends on the text-only on-device
+  /// model, so an attached image cannot be handled (the UI blocks send with a
+  /// hint).
+  final bool textOnly;
+
+  bool availableWith({required bool cloud, required bool local}) =>
+      (!needsCloud || cloud) && (!needsLocal || local);
+}
+
+/// The on-device model as a router target sees it: the plugin's model, with
+/// the context window the RAG prompt needs as its config. A routed call
+/// carries no config of its own — each target owns its own — so this is the
+/// one place the window is set, and Gemini never sees it.
+ModelRef<FlutterEdgeAiModelOptions> onDeviceModel(String name) =>
+    modelRef<FlutterEdgeAiModelOptions>(
+      flutterEdgeAi.model(name).name,
+      customOptions: FlutterEdgeAiModelOptions.$schema,
+      config: FlutterEdgeAiModelOptions(maxTokens: kOnDeviceContextTokens),
+    );
+
+/// Owns the app's Genkit instance (the on-device plugin only) and one
+/// genkit_hybrid router over the two targets, with one policy per
+/// [PolicyMode]. The Gemini plugin is handed to the router alone: the app's
+/// Genkit cannot reach the cloud without it.
+class AiEngine {
+  Genkit? _ai;
+  HybridRouter? _router;
+
+  bool cloudReady = false;
+  bool localReady = false;
+
+  /// Why the embedding model did not install, or null. The chat screen reads
+  /// it before it starts RAG: an app that ran before still has its old
+  /// embedder active, and RAG must not quietly run on that one.
+  String? embedderError;
+
+  // Budget demo signal: the app counts cloud calls against a small cap.
+  int cloudCallsSpent = 0;
+  int budgetCap = 3;
+  bool get budgetAvailable => cloudCallsSpent < budgetCap;
+
+  AiEngine();
+
+  /// Test seam: skips [FlutterEdgeAi.initialize]/`installModel` (real I/O that
+  /// can't run in a unit test). [ai] must already serve [localModel], the
+  /// plugin model name, and [cloudPlugin] must resolve [cloudModel]; either
+  /// side may be absent. Then it defines the router the way [initialize]
+  /// does, so a test driving [router] exercises the real wiring.
+  @visibleForTesting
+  AiEngine.forTest({
+    required Genkit ai,
+    String? localModel,
+    ModelRef? cloudModel,
+    GenkitPlugin? cloudPlugin,
+  }) {
+    _ai = ai;
+    localReady = localModel != null;
+    cloudReady = cloudModel != null;
+    _defineRouter(
+      local: localModel == null ? null : onDeviceModel(localModel),
+      cloud: cloudModel,
+      cloudPlugins: [?cloudPlugin],
+    );
+  }
+
+  Genkit get ai {
+    final ai = _ai;
+    if (ai == null) throw StateError('AiEngine not initialized');
+    return ai;
+  }
+
+  /// The router every chat message goes through.
+  HybridRouter get router {
+    final router = _router;
+    if (router == null) {
+      throw StateError(
+        'No router — call initialize() first; it needs at least one of the '
+        'on-device model or a cloud API key.',
+      );
+    }
+    return router;
+  }
+
+  String get embedderName => kEmbedder;
+
+  Future<void> initialize({
+    void Function(int progress)? onProgress,
+    // Test seam: install the LLM from a pre-staged local file instead of
+    // downloading it — avoids a flaky ~500MB on-device download on CI / remote phones.
+    String? localModelPath,
+    // Test seam: skip the embedder download when RAG isn't exercised.
+    bool downloadEmbedder = true,
+  }) async {
+    // RAG runs on every platform, web included. The four LiteRT.js files in
+    // web/ are copied from flutter_edge_ai_litertlm's own web/, which is where
+    // that bundle lives; the WASM runtime behind them is fetched from a CDN, so
+    // there is nothing else to host. The only thing left that can turn
+    // embeddings off here is the test seam.
+    final embeddingsSupported = downloadEmbedder;
+
+    // Building Genkit first keeps `ai` available whatever the installs below
+    // do: its plugin list is declarative (no I/O).
+    _ai = appGenkit(embedders: embeddingsSupported);
+
+    // CLOUD: needs no install; the key is all it takes.
+    cloudReady = _geminiApiKey.isNotEmpty;
+
+    // LOCAL: register the on-device engine, then install the LLM.
+    // flutter_edge_ai registers no engines by default; that registration
+    // lives inside this try/catch so an engine-init failure only suppresses
+    // localReady, never cloud.
+    try {
+      // Opt into LiteRT-LM (.litertlm inference) and its LiteRT embedding
+      // backend, on every platform (see embeddingsSupported above). `webStorageMode:
+      // streaming` (OPFS-backed) is what the size demands: the 2.0 GB web
+      // build sits right on the ~2 GB blob ceiling the default cacheApi
+      // mode would have to buffer it into, so the @litert-lm/core engine
+      // reads it from OPFS as a ReadableStream. Ignored on non-web.
+      await FlutterEdgeAi.initialize(
+        webStorageMode: WebStorageMode.streaming,
+        inferenceEngines: [LiteRtLmEngine()],
+        embeddingBackends: embeddingsSupported
+            ? [LiteRtEmbeddingBackend()]
+            : const [],
+        // A backend carries no tokenizer: which one a model needs is a
+        // property of the model, so the app registers it. Without this the
+        // embedder fails to load on Android, iOS and desktop, and the error
+        // names the package to add.
+        embeddingTokenizers: const [GemmaEmbeddingTokenizers()],
+      );
+
+      // fileType MUST be litertlm to match the LiteRT-LM engine registered
+      // above.
+      final llm = FlutterEdgeAi.installModel(
+        modelType: _modelType,
+        fileType: ModelFileType.litertlm,
+      );
+      if (localModelPath != null) {
+        await llm.fromFile(localModelPath).install();
+      } else {
+        await llm
+            .fromHuggingFace(
+              _hfRepo,
+              file: _hfModelFile,
+              token: _hfToken.isEmpty ? null : _hfToken,
+            )
+            .withProgress((p) => onProgress?.call(p)) // p is int 0..100
+            .install();
+      }
+      localReady = true;
+    } catch (e) {
+      debugPrint('⚠️ AiEngine: on-device backend unavailable — $e');
+      localReady = false;
+    }
+
+    // EMBEDDER (OPTIONAL): RAG-only, never blocks chat — a
+    // failure here must not flip localReady or rethrow.
+    if (embeddingsSupported && localReady) {
+      try {
+        await FlutterEdgeAi.installEmbedder()
+            .modelFromNetwork(
+              _embeddingModelUrl,
+              token: _hfToken.isEmpty ? null : _hfToken,
+            )
+            .tokenizerFromNetwork(
+              _tokenizerUrl,
+              token: _hfToken.isEmpty ? null : _hfToken,
+            )
+            .install();
+      } catch (e) {
+        debugPrint('⚠️ AiEngine: embedder install failed — $e');
+        embedderError = '$e';
+      }
+    }
+
+    try {
+      _defineRouter(
+        local: localReady ? onDeviceModel(kLocalModel) : null,
+        cloud: cloudReady ? googleAI.gemini(kCloudModel) : null,
+        cloudPlugins: [if (cloudReady) googleAI(apiKey: _geminiApiKey)],
+      );
+    } catch (e) {
+      // A policy naming a target the router lacks, say: nothing can be sent,
+      // so nothing may look ready.
+      cloudReady = false;
+      localReady = false;
+      rethrow;
+    }
+  }
+
+  /// The app's Genkit: the on-device plugin ONLY, and no default `model:` —
+  /// the router refuses one, because a call that forgot the router would go
+  /// there. Gemini goes to the router alone (see [initialize]).
+  @visibleForTesting
+  static Genkit appGenkit({required bool embedders}) => Genkit(
+    plugins: [
+      GenkitFlutterEdgeAiPlugin(
+        models: [
+          FlutterEdgeAiModelConfig(
+            name: kLocalModel,
+            modelType: _modelType,
+            fileType: ModelFileType.litertlm,
+          ),
+        ],
+        embedders: embedders
+            ? [FlutterEdgeAiEmbedderConfig(name: kEmbedder)]
+            : const [],
+      ),
+    ],
+  );
+
+  /// Defines the router over whichever targets are available, with the
+  /// policies of the modes they allow. With neither target there is no router.
+  void _defineRouter({
+    required ModelRef? local,
+    required ModelRef? cloud,
+    required List<GenkitPlugin> cloudPlugins,
+  }) {
+    final targets = {
+      // Gemma 3 1B reads text only: declaring no capability keeps an image
+      // away from it, so Smart sends a photo to Gemini and never falls back.
+      kOnDevice: ?(local == null
+          ? null
+          : HybridTarget.onDevice(local, supports: const {})),
+      kCloud: ?(cloud == null ? null : HybridTarget.cloud(cloud)),
+    };
+    if (targets.isEmpty) return;
+    final policies = {
+      for (final mode in PolicyMode.values)
+        if (mode.availableWith(cloud: cloud != null, local: local != null))
+          mode.name: policyFor(mode),
+    };
+    _router = defineHybridRouter(
+      ai,
+      targets: targets,
+      cloudPlugins: cloudPlugins,
+      policies: policies,
+      defaultPolicy: policies.keys.first,
+    );
+  }
+
+  /// The router's policy name for [mode]; throws a [StateError] when the
+  /// mode needs a target this engine does not have.
+  String policyName(PolicyMode mode) {
+    if (_router?.policies.containsKey(mode.name) ?? false) return mode.name;
+    throw StateError(
+      'No policy for $mode — call initialize() first (or, if this mode needs '
+      'the cloud target, make sure a cloud API key is set).',
+    );
+  }
+
+  /// Pure mode → [RoutePolicy] mapping (no models needed), so the routing
+  /// decisions are unit-testable. Cascade starts on the device; an image
+  /// skips it, because the router moves a `prefer` decision past a target
+  /// that cannot see to the first fallback that can.
+  RoutePolicy policyFor(PolicyMode mode) => switch (mode) {
+    PolicyMode.cloud => RoutePolicy(
+      rules: [
+        RouteRule.custom('cloud', (_) => const RouteDecision.only(kCloud)),
+      ],
+    ),
+    PolicyMode.local => RoutePolicy(
+      rules: [
+        RouteRule.custom('local', (_) => const RouteDecision.only(kOnDevice)),
+      ],
+    ),
+    // Cloud first, on-device when the cloud fails transiently (offline). An
+    // image never falls back: the on-device target declares no vision, so
+    // offline + image fails loudly instead of silently dropping the picture.
+    // Toward the device any transient failure moves the call, offline
+    // included; toward the cloud only an UNAVAILABLE-style Genkit status
+    // does, never INTERNAL.
+    PolicyMode.smart => RoutePolicy(
+      rules: [
+        RouteRule.custom(
+          'cloud-first',
+          (_) => const RouteDecision.prefer(kCloud),
+        ),
+      ],
+      fallback: const [kOnDevice],
+    ),
+    PolicyMode.cascade => RoutePolicy(
+      rules: [
+        RouteRule.custom(
+          'device-first',
+          (_) => const RouteDecision.prefer(kOnDevice),
+        ),
+      ],
+      fallback: const [kCloud],
+      // DEMO PROXY — not a real quality signal. A production cascade
+      // escalates on model *confidence*; the best training-free signal is
+      // the reply's average token log-probability. We can't use it here:
+      // LiteRT-LM gives the check only decoded text (no per-token
+      // probabilities), and asking a ~1B model to self-rate confidence is
+      // unreliable — small models are confidently wrong. So we escalate on a
+      // crude "too short to be a real answer" check. See the codelab's
+      // "A real cascade signal" note.
+      cascade: (result) => result.text.trim().length > 20,
+    ),
+    PolicyMode.budget => RoutePolicy(
+      rules: [
+        RouteRule.budget(
+          available: () => budgetAvailable,
+          premium: kCloud,
+          cheap: kOnDevice,
+        ),
+      ],
+      fallback: const [kOnDevice],
+    ),
+  };
+
+  void dispose() {
+    _ai = null;
+    _router = null;
+  }
+}
+```
+
+`kOnDevice` and `kCloud` are target-key constants exported by `genkit_hybrid`
+itself — reuse them instead of inventing your own strings, so every rule and
+policy agrees on the same keys.
+
+For **Step 4** we only need `PolicyMode.cloud` and `PolicyMode.local`: each
+policy has one rule that always answers `RouteDecision.only(...)` — this
+target and nowhere else. `smart`, `cascade`, and `budget` are covered in
+Step 4.5.
+
+Three things in that file run ahead of this step, and are there so you never
+have to go back and edit it. `AiEngine.forTest` and `initialize`'s
+`localModelPath` are test seams: `AiEngine.forTest` lets
+`test/ai_engine_policy_test.dart` define the real router over fake models
+without a 550 MB download, and `localModelPath` lets
+`integration_test/smoke_test.dart` install a model file staged on the device
+instead of downloading it. (`appGenkit` is split out of `initialize` for the
+same unit test, which checks that the app's own `Genkit` cannot resolve
+Gemini.) `onDeviceModel`'s `maxTokens` is Step 6's, and
+Step 6 explains it; until RAG inflates the prompt it changes nothing you can
+observe.
+
+### One router, one decision per message
+
+> **The router decides before the model runs, once.** `router.generateStream`
+> is `ai.generateStream` with the router first in its `use:` list: a Genkit
+> middleware that picks the target at the first turn of the call, sets it as
+> the call's model with that target's own config, and keeps it there for the
+> whole call — a tool loop included. Nothing downstream needs to know routing
+> happened: streaming, a RAG-augmented prompt and images all work the way they
+> do with a plain model.
+>
+> **The cloud is out of reach without it.** `googleAI(...)` is not in the
+> app's `Genkit`; it goes to `defineHybridRouter(cloudPlugins: ...)`. The app's
+> `Genkit` sees a proxy model instead, which serves a request only when the
+> router chose the cloud for that message. And the app's `Genkit` has no
+> default `model:` — the router refuses one — so a call that forgets the
+> router names no model and fails, instead of quietly going somewhere.
+
+### Add the policy picker
+
+In `chat_screen.dart`, replace Step 3's Cloud/Local `SegmentedButton` with a
+`DropdownButton` over all five `PolicyMode` values — and the two services with
+one `AiEngine _engine` and a `PolicyMode _policy`. There's nothing to hand-write per mode:
+the enum already knows its own label and its own prerequisites, so the item
+list is a loop and a new policy shows up in the picker the moment you add it
+to the enum.
+
+```dart
+Padding(
+  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+  child: DropdownButton<PolicyMode>(
+    value: _policy,
+    isExpanded: true,
+    items: [
+      for (final mode in PolicyMode.values)
+        DropdownMenuItem(
+          value: mode,
+          enabled: mode.availableWith(
+            cloud: _engine.cloudReady,
+            local: _engine.localReady,
+          ),
+          child: Text(mode.label),
+        ),
+    ],
+    onChanged: (m) {
+      if (m != null) setState(() => _policy = m);
+    },
+  ),
+),
+```
+
+`availableWith` is what keeps a half-ready app honest: with no API key only
+**Local** is selectable, and until the on-device model finishes downloading
+only **Cloud** is.
+
+### Drive generateStream through the router
+
+`_sendMessage()` no longer picks between two services — it always calls the
+same router, and the policy decides who answers:
+
+```dart
+final userMessage = Message(
+  role: Role.user,
+  content: [TextPart(text: text)],
+);
+// ...
+// The router decides where the message runs, once, and reports it on
+// the result (`result.route`). A refusal (say, an image on a text-only
+// target) is thrown as a HybridRoutingException.
+final stream = _engine.router.generateStream(
+  // `policy` is `_policy` read at the top of _sendMessage(), before any
+  // await: the dropdown stays live while a message runs.
+  policy: _engine.policyName(policy),
+  messages: [userMessage],
+);
+await for (final chunk in stream) {
+  buffer.write(chunk.text);
+  // ... the throttled setState loop, unchanged from Step 2/3
+}
+// genkit 1.0 ends the stream normally when the model fails or the
+// reply is blocked, and reports it in the result, so surface it as an error here.
+final result = await stream.onResult;
+final reason = result.finishReason;
+if (reason != FinishReason.stop &&
+    reason != FinishReason.length &&
+    reason != FinishReason.unknown) {
+  throw result.cause ??
+      StateError(result.finishMessage ?? 'The model stopped: $reason');
+}
+// ...
+// The budget demo counts the Cloud and Budget calls that really ran in
+// the cloud: the router reports the target each call ended on, so a
+// Budget call that fell back to the device is not counted.
+if ((policy == PolicyMode.cloud || policy == PolicyMode.budget) &&
+    result.route?.target == kCloud) {
+  _engine.cloudCallsSpent++;
+}
+```
+
+`text` goes straight to the model here. In Step 6 RAG rewrites it first,
+and the local is renamed `prompt` to say so — the call itself does not
+change. `result.route` also carries the policy, the rule that decided and how
+long deciding took — print it once to see what the router did.
+
+### Test it
+
+1. Switch to **Cloud** and send a message — Gemini answers.
+2. Switch to **Local** and send a message — Gemma 3 1B answers.
+3. Leave **Smart**, **Cascade**, and **Budget** for Step 4.5 — their
+   policies are already defined, but nothing exercises their interesting
+   behavior (an image, a bad on-device answer, a spent budget) until then.
+
+## Step 4.5: Smart routing & images
+Duration: 20
+
+Three of the five `PolicyMode` values only get interesting once the app can
+send more than plain text, and once there's a signal to route on besides "the
+user picked cloud or local." This step adds image input, lets the router match
+it against what each target can do, and walks through what `smart`, `cascade`,
+and `budget` actually decide.
+
+### Update dependencies
+
+```yaml
+  # Image input (multimodal)
+  image_picker: ^1.2.3
+```
+
+Run `flutter pub get`.
+
+On **macOS** the picker is a file dialog (`image_picker` uses `file_selector`
+there), and the app sandbox only lets the app read a file the user picked if
+it holds the read-only user-selected-files entitlement. Add it to **both**
+`macos/Runner/DebugProfile.entitlements` and
+`macos/Runner/Release.entitlements`, beside the network key from Step 2:
+
+```xml
+	<key>com.apple.security.files.user-selected.read-only</key>
+	<true/>
+```
+
+`step_04_smart_routing` and every step after it already carry it.
+
+On **iOS** the gallery picker is `PHPicker`, which asks for no permission, but
+`image_picker`'s README says App Store policy still requires a photo-library
+usage string in `ios/Runner/Info.plist`:
+
+```xml
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>Attach a photo from your library to a chat message.</string>
+```
+
+`step_04_smart_routing` and every step after it carry that too.
+
+### Attach an image
+
+In `chat_screen.dart`, add the picker and its state:
+
+```dart
+import 'dart:convert';
+import 'dart:typed_data';
+// ...
+import 'package:image_picker/image_picker.dart';
+
+// in _ChatScreenState:
+final _picker = ImagePicker();
+Uint8List? _attachedImage;
+String? _attachedMime;
+
+// ...
+Future<void> _attachImage() async {
+  final XFile? picked = await _picker.pickImage(source: ImageSource.gallery);
+  if (picked == null) return;
+  final bytes = await picked.readAsBytes();
+  if (!mounted) return;
+  setState(() {
+    _attachedImage = bytes;
+    _attachedMime = picked.mimeType ?? 'image/jpeg';
+  });
+}
+```
+
+Add an `IconButton(icon: const Icon(Icons.image_outlined))` next to the send
+button that calls `_attachImage`, and a small thumbnail preview (`Image.memory`
++ a close button) shown above the input row while `_attachedImage != null`.
+
+### Build a multimodal message
+
+`_sendMessage()` now builds a `content` list instead of a single `TextPart`:
+
+```dart
+final content = <Part>[TextPart(text: text)];
+if (_attachedImage != null) {
+  final mime = _attachedMime ?? 'image/jpeg';
+  final dataUri = 'data:$mime;base64,${base64Encode(_attachedImage!)}';
+  // Gemini, the on-device plugin and the router all read the type
+  // from the data: URI as well; contentType states it outright.
+  content.add(
+    MediaPart(
+      media: Media(contentType: mime, url: dataUri),
+    ),
+  );
+}
+final userMessage = Message(role: Role.user, content: content);
+```
+
+`contentType` is not load-bearing here. When it is missing,
+`genkit_flutter_edge_ai` types a `MediaPart` from its `data:` URI, its file
+extension or its bytes, and answers a part it still cannot type with an
+`INVALID_ARGUMENT` error rather than dropping it; the Gemini plugin reads the
+`data:` URI's type too, and the router (below) recognizes vision from a
+`data:image/…` URL or a recognized image file extension. An
+`image_picker` file with no MIME type falls back to `'image/jpeg'`, so the
+URI and `contentType` always agree.
+
+### Smart, Cascade, and Budget
+
+Back in `AiEngine.policyFor`, the three remaining policies:
+
+```dart
+// Cloud first, on-device when the cloud fails transiently (offline). An
+// image never falls back: the on-device target declares no vision, so
+// offline + image fails loudly instead of silently dropping the picture.
+PolicyMode.smart => RoutePolicy(
+  rules: [
+    RouteRule.custom(
+      'cloud-first',
+      (_) => const RouteDecision.prefer(kCloud),
+    ),
+  ],
+  fallback: const [kOnDevice],
+),
+PolicyMode.cascade => RoutePolicy(
+  rules: [
+    RouteRule.custom(
+      'device-first',
+      (_) => const RouteDecision.prefer(kOnDevice),
+    ),
+  ],
+  fallback: const [kCloud],
+  cascade: (result) => result.text.trim().length > 20,
+),
+PolicyMode.budget => RoutePolicy(
+  rules: [
+    RouteRule.budget(
+      available: () => budgetAvailable,
+      premium: kCloud,
+      cheap: kOnDevice,
+    ),
+  ],
+  fallback: const [kOnDevice],
+),
+```
+
+A decision is `prefer` — it may move to the policy's `fallback` — or `only`,
+which never moves. And the targets say what they can do:
+`HybridTarget.onDevice(local, supports: const {})` declares that Gemma 3 1B
+takes no image, so the router never sends one there.
+
+- **Smart** — `prefer(kCloud)` with `kOnDevice` as the fallback. A text
+  request falls back to the phone when the cloud call fails with a transient
+  error — offline, say. An image request needs vision, which the on-device
+  target does not declare, so the router drops it from the fallback list:
+  there is no second target to fall to, by design.
+- **Cascade** — `prefer(kOnDevice)`, then the `cascade` check judges the
+  answer: "longer than 20 characters" keeps it, anything shorter escalates to
+  the cloud. While the check is pending the on-device chunks are held back, so
+  the chat never shows an answer that gets replaced; an accepted answer is
+  sent at once, a rejected one is dropped and the cloud streams live.
+- **Budget** — `RouteRule.budget` answers `prefer(kCloud)` while
+  `budgetAvailable()` is true, and `only(kOnDevice)` once it isn't. `AiEngine`
+  owns the budget itself: `cloudCallsSpent` is a plain int the app increments
+  after every Cloud or Budget call that ran in the cloud (see the
+  `_sendMessage` snippet above — `result.route` says where it ran) and
+  compares against `budgetCap` (3 by default). `genkit_hybrid` has no billing
+  SDK — it only ever sees the resulting `bool`.
+
+Fallback and cascade both stop the moment anything has run: once a chunk
+reached the chat or a tool ran, the router keeps the answer it has, because
+running the call again elsewhere would run its tools again.
+
+> **A real cascade signal.** That `cascade` check is a *deliberately crude*
+> demo proxy — "long enough" is a poor stand-in for "good enough" (a correct
+> `"Paris."` escalates needlessly; 25 characters of nonsense passes). A
+> production cascade escalates on model **confidence**, and a strong
+> training-free signal is the reply's **average token log-probability** — how
+> surprised the model was by its own tokens; with no training data it matches
+> or beats supervised routers, and holds up out-of-distribution. We fall back
+> to a length check for one honest reason: the on-device runtime (LiteRT-LM)
+> returns only decoded text, so the check never sees per-token probabilities.
+> Asking the model to state its own confidence is no safe shortcut either: how
+> well that separates right answers from wrong ones varies widely between
+> small models, and one model studied gave an almost constant confidence. (See
+> [Zero-Shot Confidence for Small LLMs](https://arxiv.org/abs/2605.02241) and
+> [Do Small LMs Know When They're Wrong?](https://arxiv.org/abs/2604.19781).)
+
+> **Smart + image on a cloud outage fails, and that's the point**: with an
+> attached image, the only target that can take it is `kCloud`, and nothing
+> stands behind it. Offline, that call fails and the error reaches the chat as
+> `Error: ...`. Falling back to the phone would hand the picture to a model
+> that can't see it, which answers from the question's text alone — a
+> confident, plausible reply about a photo nobody read. A wrong answer nobody
+> flags is worse than a visible failure. Text is unaffected: an offline text
+> question still lands on the phone.
+>
+> **Budget shares its counter with Cloud**: `cloudCallsSpent` is one counter,
+> not one per policy — a Cloud-mode send also spends the Budget allowance.
+> Demo Cloud before Budget and the allowance may already be partly (or
+> fully) spent by the time you switch.
+
+### The capability block
+
+An image can't reach a policy whose every route ends on the text-only
+on-device model — which is exactly the `textOnly` flag each `PolicyMode`
+already carries, so there's no helper to write and no second list of modes to keep in
+sync. `_sendMessage()` checks it before doing anything else:
+
+```dart
+final policy = _policy; // this send's mode, read before any await
+if (_attachedImage != null && policy.textOnly) {
+  ScaffoldMessenger.of(context).showSnackBar(
+    const SnackBar(
+      content: Text(
+        "The on-device model can't see images — switch to Smart or Cloud.",
+      ),
+    ),
+  );
+  return;
+}
+```
+
+`local` always runs on-device — it is declared `textOnly: true` and blocked.
+`smart` and `cloud` send an image to `kCloud` and nowhere else, so they're let
+through. So is `cascade`: it starts on the device, but the router moves a
+`prefer` decision past a target that cannot see to the first fallback that
+can, so an image skips the phone and goes straight to `kCloud`.
+`budget` is let through as well, but that's the one optimistic case: once
+`cloudCallsSpent` hits `budgetCap`, the budget rule answers `only(kOnDevice)`
+— `textOnly` is a fact about the policy, not about its current spend, so an
+image sent on a spent budget is refused by the router (`Error: ...`), not
+answered by a model that can't see it.
+
+### Manual runbook
+
+1. Send a text message in each of the five modes — Cloud, Local, Smart,
+   Cascade, Budget — and confirm each one answers.
+2. Attach an image, switch to **Smart**, and send — the response comes from
+   Gemini (the only target that declares vision).
+3. Turn off WiFi, stay on **Smart**, and send a text message — the cloud
+   attempt fails and the router falls back to `kOnDevice` (slower, but it
+   answers). Now attach an image and send that instead: this one fails with
+   `Error: ...`, because a vision request has no on-device fallback.
+4. Turn WiFi back on, switch to **Budget**, and keep sending text messages.
+   `cloudCallsSpent` counts every Cloud- or Budget-mode call that ran in the
+   cloud, cumulatively for the whole session — including the Cloud-mode
+   message from step 1 — so it may already be close to `budgetCap` (3) by
+   the time you get here. Once it reaches the cap, routing flips to
+   on-device only (the budget rule sees `budgetAvailable == false`); a hot
+   restart resets the counter to 0 if you want to watch it flip from a clean
+   count.
+5. Switch to **Local** and attach an image — send is blocked before any
+   request goes out, with the "can't see images" snackbar.
+
+`flutter test test/ai_engine_policy_test.dart` defines the same router over
+fake models and runs these routes — fallback, the image block, cascade, the
+budget flip — as a fast, deviceless unit test, useful to rerun after touching
+routing logic instead of redoing the whole runbook by hand.
+
+## Step 5: Embeddings with Genkit
+Duration: 20
+
+### How embeddings work
+
+An embedding turns text into a vector of numbers that captures semantic meaning.
+Similar texts have similar vectors. EmbeddingGemma 300M runs entirely on-device.
+
+### Web setup for embeddings
+
+Copy four files into `web/`, the same way you copied `cache_api.js` and
+`opfs_helper.js` in Step 3:
+
+```
+litert.js   litert_embeddings.js   sentencepiece.js   tensorflow.js
+```
+
+They come from `flutter_edge_ai_litertlm/web/`. The bundle moved there in the
+legacy `flutter_gemma_litertlm` 1.8.0 release and remains owned by the current
+package. Take them from the version your app resolves: 1.13.0 changed the
+bundle's API, and a copy from an older release fails `getActiveEmbedder()` with
+an error that names the file. Then load the entry point in `web/index.html`:
+
+```html
+<script type="module" src="litert_embeddings.js"></script>
+```
+
+That is the whole web setup. The WASM runtime underneath is fetched from a
+CDN, so there is nothing else to host.
+
+> An earlier version of this codelab told you embeddings could not run in a
+> browser at all. That was true then: the bundle was split across two packages
+> and the WASM runtime it needs was not published anywhere, so the four files
+> loaded without error and had nothing to call underneath them. Both are fixed
+> in legacy `flutter_gemma_litertlm` 1.8.0 and remain fixed in the current
+> `flutter_edge_ai_litertlm` package.
+
+One thing the app must do on the native platforms: register a tokenizer. That
+change shipped in legacy `flutter_gemma` 1.9.0 and is part of the current
+`flutter_edge_ai`: an embedding backend no longer carries one — which tokenizer
+a model needs is a property of the model, not of the engine that runs it — so
+`AiEngine.initialize()` passes
+`embeddingTokenizers: const [GemmaEmbeddingTokenizers()]` beside
+`embeddingBackends:`. Leave it out and the first embedding on Android, iOS or
+desktop fails when the embedder loads, and the error names the package to add.
+The web never asks for it: LiteRT.js tokenizes in the browser, with the
+`sentencepiece.js` you just copied.
+
+### Install the embedding model
+
+This already runs inside `AiEngine.initialize()`, in the optional block after
+the LLM install, on every platform. A failure is kept in `embedderError`, which
+turns RAG off with the reason shown, and never touches the chat:
+
+```dart
+await FlutterEdgeAi.installEmbedder()
+    .modelFromNetwork(
+      _embeddingModelUrl,
+      token: _hfToken.isEmpty ? null : _hfToken,
+    )
+    .tokenizerFromNetwork(
+      _tokenizerUrl,
+      token: _hfToken.isEmpty ? null : _hfToken,
+    )
+    .install();
+```
+
+`_embeddingModelUrl` names the `seq1024` build of EmbeddingGemma: 183 MB,
+plus the 4.7 MB `sentencepiece.model`. Each `.tflite` build takes a fixed
+number of tokens — 1024 here, task prefix included — and a longer input is
+refused, never truncated. A city guide is about 470–550 tokens, so the
+smaller `seq256` build would refuse every one of them.
+
+### Register the embedder with Genkit
+
+There's no second `Genkit` to build — `AiEngine` already declared the embedder
+back in Step 4, right next to the on-device model in the *same*
+`GenkitFlutterEdgeAiPlugin`, gated by the same `embeddingsSupported`:
+
+```dart
+GenkitFlutterEdgeAiPlugin(
+  models: [
+    FlutterEdgeAiModelConfig(
+      name: kLocalModel,
+      modelType: _modelType,
+      fileType: ModelFileType.litertlm,
+    ),
+  ],
+  embedders: embeddingsSupported
+      ? [FlutterEdgeAiEmbedderConfig(name: kEmbedder)]
+      : const [],
+),
+```
+
+So the one `AiEngine` Genkit already exposes the embedder — you just call
+`ai.embed(...)` on it (next).
+
+### Generate embeddings
+
+```dart
+final embeddings = await _ai.embed(
+  embedder: flutterEdgeAi.embedder(_embedderName),
+  document: DocumentData(content: [TextPart(text: content)]),
+);
+```
+
+`embeddings.first.embedding` is the `List<double>` — 768 numbers for
+EmbeddingGemma 300M.
+
+### Index the tourist data
+
+Create `lib/services/rag_service.dart`. In `initialize()`, loop over 10 city
+JSON files and embed each one. Store the `List<double>` vectors in memory.
+
+```dart
+for (final city in _cityFiles) {
+  onStatus?.call('Embedding $city...');
+  final jsonString = await rootBundle.loadString(
+    'assets/tourist_data/$city.json',
+  );
+  final data = jsonDecode(jsonString) as Map<String, dynamic>;
+
+  final name = data['name'] as String? ?? city;
+  final content = _buildContent(data);
+
+  final embeddings = await _ai.embed(
+    embedder: flutterEdgeAi.embedder(_embedderName),
+    document: DocumentData(content: [TextPart(text: content)]),
+  );
+
+  _store.add(
+    _VectorDocument(
+      id: city,
+      content: content,
+      city: name,
+      embedding: embeddings.first.embedding,
+    ),
+  );
+}
+```
+
+> **Key insight**: `ai.embed(embedder: ...)` is model-agnostic. Replace
+> `flutterEdgeAi.embedder(...)` with any other registered embedder — the rest
+> of the code stays the same.
+
+## Step 6: RAG — Retrieval-Augmented Generation
+Duration: 20
+
+### Wire RagService to AiEngine
+
+`RagService` doesn't manage its own `Genkit` instance or model installation —
+it takes both from `AiEngine`, the same way `_sendMessage` does:
+
+```dart
+// Without this check RAG would start on whatever embedder an earlier run left
+// active, and its errors would hide the install failure.
+final installError = _engine.embedderError;
+if (installError != null) {
+  throw StateError('embedder install failed: $installError');
+}
+final rag = RagService(
+  ai: _engine.ai,
+  embedderName: _engine.embedderName,
+);
+await rag.initialize(
+  onStatus: (s) {
+    if (mounted) setState(() => _statusMessage = s);
+  },
+);
+_ragService = rag;
+_ragReady = true;
+```
+
+That block runs on every platform. If the embedder did not install —
+`AiEngine` keeps that error in `embedderError` — or `RagService.initialize()`
+throws, a missing JS file on web for one, the catch records the reason instead
+of swallowing it:
+
+```dart
+} catch (e) {
+  debugPrint('RAG init failed: $e');
+  _ragUnavailableReason = '$e';
+}
+```
+
+`build()` reads `_ragUnavailableReason` and shows a one-line banner under the
+policy picker whenever it's set — RAG shows up as unavailable, with why,
+instead of the toggle just staying disabled with no explanation.
+
+### Semantic search
+
+When the user sends a query, embed it and find the closest city documents
+using cosine similarity. The two retrieval numbers get names — they're the
+knobs you'll actually reach for, and one of them decides how much text the
+on-device model has to swallow:
+
+```dart
+/// Minimum cosine similarity threshold for RAG retrieval results.
+const double kMinSimilarity = 0.5;
+
+/// Maximum number of documents to retrieve from the vector store.
+const int kTopK = 3;
+
+// ...
+
+Future<RagResult> searchAndBuildContext(String query) async {
+  if (!_isInitialized) throw StateError('RagService not initialized');
+
+  final queryEmbeddings = await _ai.embed(
+    embedder: flutterEdgeAi.embedder(_embedderName),
+    document: DocumentData(content: [TextPart(text: query)]),
+  );
+  final queryVector = queryEmbeddings.first.embedding;
+
+  final scored =
+      _store
+          .map(
+            (doc) => (doc: doc, score: _cosine(queryVector, doc.embedding)),
+          )
+          .where((r) => r.score >= kMinSimilarity)
+          .toList()
+        ..sort((a, b) => b.score.compareTo(a.score));
+
+  final topK = scored.take(kTopK).toList();
+
+  if (topK.isEmpty) {
+    return RagResult(
+      augmentedPrompt: query,
+      retrievedContext: '',
+      sources: [],
+    );
+  }
+
+  final context = topK.map((r) => r.doc.content).join('\n\n');
+  final sources = topK
+      .map((r) => '${r.doc.city} (${(r.score * 100).toStringAsFixed(0)}%)')
+      .toList();
+
+  final augmentedPrompt =
+      'Based on the following travel information:\n\n$context\n\n'
+      'Answer the question: $query';
+
+  return RagResult(
+    augmentedPrompt: augmentedPrompt,
+    retrievedContext: context,
+    sources: sources,
+  );
+}
+```
+
+`_cosine` throws an `ArgumentError` when the two vectors' lengths disagree
+rather than asserting it — an `assert` is compiled out of a release build,
+which is precisely where a mismatched embedder would otherwise return
+silent nonsense.
+
+### Give the on-device target room to read
+
+`kTopK` is the first knob in this codelab that can break a working app.
+Retrieval doesn't just improve the prompt, it *inflates* it — and the
+on-device target is answering inside a fixed window.
+
+> **`maxTokens` is the whole context window, not the reply length.** It is the
+> KV-cache budget: everything the model reads *plus* everything it writes.
+> `genkit_flutter_edge_ai` defaults it to 1024, which is fine for the chat we've
+> had so far and not fine the moment RAG lands. Three city guides at ~600
+> tokens each is ~1.7k of prompt before the model has said a word, so the
+> first RAG question on **Local** dies during prefill with
+> `Input token ids are too long ... 1713 >= 1024` — a native error, not a bad
+> answer. The fix isn't a smaller `kTopK`: the bundled Gemma 3 1B was built
+> for a 4096-token window, which is what the `ekv4096` in its file name means.
+> Give the on-device target the window it already has.
+
+Back in `AiEngine`, the on-device target already carries that budget — it is
+the config of the model the router hands the target:
+
+```dart
+/// Context window for the on-device target, in tokens. `maxTokens` is the
+/// WHOLE window (input + output) and genkit_flutter_edge_ai defaults it to 1024.
+/// RagService's take(3) of ~600-token city guides alone is ~1.7k tokens —
+/// measured on device: "Input token ids are too long … 1713 >= 1024". The
+/// bundled Gemma-3-1B `.litertlm` is built for 4096 (`ekv4096`), so use it.
+const kOnDeviceContextTokens = 4096;
+
+/// The on-device model as a router target sees it: the plugin's model, with
+/// the context window the RAG prompt needs as its config. A routed call
+/// carries no config of its own — each target owns its own — so this is the
+/// one place the window is set, and Gemini never sees it.
+ModelRef<FlutterEdgeAiModelOptions> onDeviceModel(String name) =>
+    modelRef<FlutterEdgeAiModelOptions>(
+      flutterEdgeAi.model(name).name,
+      customOptions: FlutterEdgeAiModelOptions.$schema,
+      config: FlutterEdgeAiModelOptions(maxTokens: kOnDeviceContextTokens),
+    );
+```
+
+A routed call takes no `config:` of its own — the router refuses one —
+because each target owns its config: the router sends `maxTokens: 4096` with
+every request that runs on the phone, and nothing with the ones that run in
+the cloud, whose window is orders of magnitude larger. A cascade that
+escalates from the phone to the cloud can't carry the phone's config along.
+
+### Add RAG toggle to the UI
+
+In `chat_screen.dart`:
+1. Add a `Switch` in the `AppBar` to toggle RAG
+2. In `_sendMessage()`, if RAG is enabled call `searchAndBuildContext(text)` before generating
+3. Display `ragResult.sources` in a banner below the AppBar
+4. Display `_ragUnavailableReason`, when set, in a banner of its own — the
+   `Switch` alone (disabled, unlabeled) doesn't say *why* RAG is off
+
+### Test it
+
+Try these queries:
+- "What should I eat in Tokyo?" → sources: Tokyo (92%)
+- "Best European city for history?" → sources: Prague (78%), Istanbul (71%)
+- "Tell me about the Eiffel Tower" → sources: Paris (95%)
+
+If RAG fails to initialize on any platform, the `Switch` stays disabled and a
+banner reports the reason rather than leaving the toggle silently off; the
+rest of the app (all five policies, image input) keeps working.
+
+## Step 7: Polish and Conclusion
+Duration: 10
+
+### Error handling and loading states
+
+- Show download progress during model installation
+- Disable a policy the app can't serve — that's `mode.availableWith(...)` in
+  the picker
+- Gate *every* send entry point, the button and `TextField.onSubmitted` alike,
+  on the same condition — nothing in flight, and at least one target ready
+- Show "Generating..." indicator during streaming
+- Graceful error messages in the chat
+
+### What we built
+
+| Capability | Technology |
+|------------|-----------|
+| Cloud inference | `genkit_google_genai` → Gemini 3.7 Flash |
+| On-device inference | `genkit_flutter_edge_ai` → Gemma 3 1B |
+| Hybrid routing | `genkit_hybrid` — one router, one policy per mode (cloud, local, smart, cascade, budget) |
+| Multimodal input | `image_picker` + `MediaPart`, routed by the targets' declared capabilities |
+| On-device embeddings | `genkit_flutter_edge_ai` → EmbeddingGemma 300M, including Web |
+| RAG pipeline | Genkit `embed()` + in-memory cosine search, including Web |
+
+### The Genkit advantage
+
+The old approach needed two completely different APIs — Firebase AI Logic for
+cloud and raw flutter_edge_ai calls for local. With Genkit:
+
+```dart
+// Every backend is a Genkit model or embedder behind the same API:
+ai.generateStream(model: flutterEdgeAi.model('gemma-3-1b-it'), prompt: prompt)
+ai.embed(embedder: flutterEdgeAi.embedder('embedding-gemma-300m'), document: ...)
+
+// Gemini sits behind the router, which owns its plugin: the same call
+// reaches either model.
+engine.router.generateStream(policy: policyName, messages: [userMessage])
+```
+
+Routing, fallback and observability all work the same way regardless of which
+model backend you use, and so does tool calling on a model that supports it —
+Gemma 3 1B does not.
+
+### What's next
+
+- **Production embeddings**: Persist the vector store with SQLite + `drift` so
+  you don't re-embed on every cold start
+- **More models**: Swap `gemini-3.7-flash` for `gemini-3.1-pro-preview` for
+  complex queries, or add a second on-device model for specialized tasks
+- **Genkit flows**: Wrap the hybrid routing in a `defineFlow` to add
+  observability, retries, and structured output
+- **Decide on the device**: give a policy a classifier —
+  `genkit_flutter_edge_ai`'s `deciderRouteClassifier` turns an EmbeddingGemma
+  decider into one — and map its labels to targets, after your rules
+- **On-device RAG with Qdrant**: Replace the in-memory store with
+  [Qdrant](https://qdrant.tech) for persistent, scalable vector search
+
+### Resources
+
+- [genkit_flutter_edge_ai on pub.dev](https://pub.dev/packages/genkit_flutter_edge_ai)
+- [genkit_hybrid on pub.dev](https://pub.dev/packages/genkit_hybrid)
+- [genkit on pub.dev](https://pub.dev/packages/genkit)
+- [genkit_google_genai on pub.dev](https://pub.dev/packages/genkit_google_genai)
+- [flutter_edge_ai on pub.dev](https://pub.dev/packages/flutter_edge_ai)
+- [Genkit Dart documentation](https://genkit.dev)
+
+## Share what you built
+
+Finished the codelab or turned it into something of your own? [Submit your project to the Flutter Edge AI showcase](https://flutteredge.ai/showcase/submit) so the community can discover it.

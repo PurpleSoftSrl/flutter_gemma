@@ -1,0 +1,331 @@
+---
+title: Function Calling
+description: Let on-device models call external functions and integrate with other services.
+meta:
+  - property: og:image
+    content: https://flutteredge.ai/images/og-image.png
+---
+
+Function calling lets a model request that your app run an external function —
+for example, changing the UI, querying a database, or calling another service —
+and then continue the conversation with the result.
+
+## Supported models
+
+### Models with function calling support
+
+A call takes one of two paths, chosen from `modelType` and the file type:
+
+- **The runtime's own tool path** — **Gemma 4** (E2B, E4B) and **FunctionGemma
+  270M** on a `.litertlm`: the declarations reach LiteRT-LM as structured data
+  and the calls come back parsed (see
+  [Who renders the declarations](#who-renders-the-declarations)). A `.gguf`
+  through [llama.cpp](/docs/llama) takes this path too, when the model's chat
+  template supports tools.
+- **Prompt-based** — every other model, in a chat created with
+  `supportsFunctionCalls: true` (except Gemma 4, which needs a `.litertlm` — see
+  [Platform support](#platform-support)): the chat writes the tools into the
+  prompt and parses the calls back out of the text. For example:
+  - **Gemma 3n E4B** — on the downloadable E4B `.litertlm` build; not on E2B or
+    the MediaPipe `.task` builds.
+  - **FunctionGemma 270M** as a MediaPipe `.task`.
+  - **DeepSeek R1** — function calling + thinking mode.
+  - **Qwen 2.5 0.5B / 1.5B** (`.task`) and **Qwen3 0.6B** (`.litertlm` — use
+    `Qwen3-0.6B_dynamic_wi4b32_afp32.litertlm`; `Qwen3-0.6B.litertlm`
+    downloaded after 2026-10-13, 15:53 UTC loads on macOS, other platforms not
+    run, [#659](https://github.com/DenisovAV/flutter_edge_ai/issues/659)).
+  - **Phi-4 Mini**.
+  - The [Built-in AI](#built-in-ai-os-models) OS models.
+
+See [Models](/docs/models) for which models declare function calling.
+
+### Models without function calling support
+
+- **Gemma 3 270M** — text generation only.
+- **Gemma 3 1B** — text generation only.
+- **SmolLM 135M** — text generation only.
+- **LFM2.5 230M (Liquid AI)** — text generation only.
+- **SmolLM3 3B** — text generation with reasoning, no function calling.
+- **Phi-4 Mini Reasoning** — reasoning model, no function calling.
+- **FastVLM 0.5B** — vision model, no function calling.
+- **Qwen2-VL 2B** — vision model, no function calling.
+- **SmolVLM2 500M** — vision model, no function calling.
+- **LLaVA-OneVision 0.5B** — vision model, no function calling.
+
+<Info>
+
+If you pass `tools` with `supportsFunctionCalls: false`, the chat logs a warning
+(debug builds only), does not write them into the prompt and does not parse
+calls out of the reply — the model still works normally for text generation.
+Gemma 4 and FunctionGemma on a `.litertlm` are the exception: there the
+declarations still reach LiteRT-LM, though the chat still does not parse the
+calls. A `.gguf` model is the other: its tools are on unless
+`supportsFunctionCalls` is `false`, and `false` drops them with no warning.
+Pass `supportsFunctionCalls: true` to `openChat` for models that
+support it.
+
+</Info>
+
+### Built-in AI (OS models)
+
+[Built-in AI](/docs/builtin-ai) models — Gemini Nano (Android), Apple Foundation
+Models (iOS/macOS), Phi Silica (Windows), and browser Prompt APIs (Web) — also
+support function calling, but it is **prompt-based**: these OS models don't expose a usable
+structured tool API, so core `InferenceChat` weaves the tool definitions into
+the prompt and parses the calls back out of the model's text. You declare tools
+the same way (see below). Gemini Nano handles single-turn tool calls; multi-turn
+agent chaining is **not** supported on Web.
+
+## Declaring tools
+
+Describe each function as a `Tool` — a `name`, a `description`, and a
+JSON-Schema `parameters` map — then pass the list to `openChat` (or
+`openChat`) together with `supportsFunctionCalls: true`. `openSession` also
+takes `tools:`, and the two passthrough families read them there, through the
+runtime's own tool path: Gemma 4, and FunctionGemma on a `.litertlm`. For every
+other model it is the chat that puts the tools into the prompt and parses the
+calls back out, so use the chat API:
+
+<Warning>
+
+A tool chat cannot also have `responseFormat`.
+`openChat(tools: ..., responseFormat: ...)` throws `ArgumentError` before the
+engine is called, because a tool call is not a value of the requested response
+format. Use separate chats/sessions for the tool phase and the final typed JSON
+phase, or request JSON in the prompt and validate it in the app.
+
+</Warning>
+
+```dart
+final tools = [
+  const Tool(
+    name: 'change_background_color',
+    description: 'Change the app background color.',
+    parameters: {
+      'type': 'object',
+      'properties': {
+        'color': {'type': 'string', 'description': 'A CSS color name.'},
+      },
+      'required': ['color'],
+    },
+  ),
+];
+
+final chat = await model.openChat(
+  tools: tools,
+  supportsFunctionCalls: true,
+  toolChoice: ToolChoice.auto,
+);
+```
+
+`ToolChoice` controls whether the model may call a tool:
+
+- `ToolChoice.auto` (default) — the model decides.
+- `ToolChoice.required` — the model must respond with a function call.
+- `ToolChoice.none` — the model must not call any tool. Where the SDK renders the
+  declarations this takes them out of the prompt; on a `.litertlm` Gemma 4 or
+  FunctionGemma the runtime already holds them, so the model can still emit a
+  call — and with parsing off it reaches the stream as raw text.
+
+<Info>
+
+`ToolChoice.required` reaches the model only where the SDK writes the
+declarations itself. Gemma 4, and FunctionGemma on a `.litertlm`, hand them to
+the runtime instead, and the runtime's tool payload carries no `tool_choice` —
+so for those two `required` behaves as `auto`, silently. A `.task`
+FunctionGemma gets the old "not supported" warning, and the JSON-format
+families (Qwen, DeepSeek, Phi-4 Mini) do get a "you must call a function"
+instruction written into their prompt.
+
+</Info>
+
+## Who renders the declarations
+
+On a `.litertlm`, both Gemma 4 and FunctionGemma go through LiteRT-LM's own tool
+path: the declarations travel to the runtime as structured data, the call comes
+back parsed, and the result of a turn goes back as one role-`tool` message that
+continues the same model turn. That is true for FunctionGemma too, in every
+`flutter_edge_ai` release (it arrived in `flutter_gemma` 1.8.4 with
+`flutter_gemma_litertlm` 1.7.1) — before them,
+its tool results were sent as an ordinary user message, and the model answered
+them by repeating the call it had just made. Both halves are needed: core decides
+the wire format, the engine sends it.
+
+Where a call comes back as text rather than structured `tool_calls` — the web
+SDK, or a `.litertlm` exported without the FunctionGemma model type, whose
+runtime opens no tool-call channel — flutter_edge_ai parses that text itself, so
+your code still receives a `FunctionCallResponse`.
+
+Two consequences worth knowing:
+
+- Nothing in your code changes. `openChat(tools: ..., supportsFunctionCalls: true)`
+  and the loop stay the same; the wire format is chosen from `modelType` and the
+  file type together.
+- `ToolChoice.none` cannot take the declarations back out, because the runtime
+  holds them. It stops the SDK from suppressing tool-call text, which is why a
+  call made under `none` can reach the bubble as raw markup.
+
+On `.task` models through MediaPipe there is no native tool path, so
+FunctionGemma keeps the text wire format the SDK renders itself.
+
+FunctionGemma is also an action model, and that shows in the turn after the
+result: `google/mobile-actions`, the corpus it is tuned on, does not contain a
+single row where the assistant writes a sentence after a tool result, so it
+often ends its turn at the call. Render the tool's own result in your UI rather
+than waiting for prose, and reach for Gemma 4 when you want the model to talk
+about what came back.
+
+## Handling function calls
+
+When the model wants to call a function, the response stream emits a
+`FunctionCallResponse` with the function name and arguments. Execute it, then send
+a `Message.toolResponse(...)` back to the model:
+
+```dart
+chat.generateChatResponseAsync().listen((response) {
+  if (response is TextResponse) {
+    // Regular text token
+    print('Text token: ${response.token}');
+  } else if (response is FunctionCallResponse) {
+    // Model wants to call a function
+    print('Function: ${response.name}');
+    print('Arguments: ${response.args}');
+    _handleFunctionCall(response);
+  }
+});
+```
+
+<Info>
+
+A model can also request **several** calls at once — the stream then emits a
+`ParallelFunctionCallResponse` carrying a `calls` list of `FunctionCallResponse`s.
+`generateChatResponseWithTools` (below) handles this internally; a manual
+listener must handle it too:
+
+```dart
+} else if (response is ParallelFunctionCallResponse) {
+  for (final call in response.calls) {
+    _handleFunctionCall(call);
+  }
+}
+```
+
+</Info>
+
+Send the function result back to the model so it can continue:
+
+```dart
+// `call` is the FunctionCallResponse you just ran.
+final toolMessage = Message.toolResponse(
+  toolName: call.name,
+  response: {'status': 'success', 'color': 'blue'},
+  toolCallId: call.id, // null when the engine gave the call no id
+);
+await chat.addQueryChunk(toolMessage);
+final followUp = await chat.generateChatResponse();
+```
+
+Only `flutter_edge_ai_llama` gives calls ids and reads `toolCallId`: pass it
+there when two calls share a name and their results go back out of order. The
+`.litertlm`, MediaPipe, ONNX and built-in AI engines give none and pair a
+result with its call by `toolName`, in order. genai `callId`s and Genkit
+`ref`s carry theirs, and they stay in the history.
+
+### Or drive the whole loop in one call (recommended)
+
+`InferenceChat.generateChatResponseWithTools` runs that whole cycle for you — it
+streams the reply, and whenever the model calls a tool it invokes your
+`onToolCall`, feeds the result back as a `Message.toolResponse` carrying the
+call's id, and continues until the model produces a final call-free answer
+(bounded by `maxToolTurns`).
+You only implement the tools; the parse → execute → feed-back loop is handled.
+
+```dart
+// Stage the user message first, as for generateChatResponseAsync.
+await chat.addQueryChunk(
+  Message.text(text: 'Make the background blue', isUser: true),
+);
+
+final stream = chat.generateChatResponseWithTools(
+  onToolCall: (call) async {
+    // Run whatever tool the model asked for; return its result map.
+    return switch (call.name) {
+      'change_background_color' => {'status': 'success', 'color': call.args['color']},
+      _ => {'error': 'unknown tool ${call.name}'},
+    };
+  },
+  maxToolTurns: 8,           // safety cap on tool round-trips
+  isCancelled: () => false,  // optional: return true to stop (e.g. barge-in)
+);
+
+await for (final response in stream) {
+  if (response is TextResponse) print(response.token); // final-answer tokens
+}
+```
+
+Gemma 4 often writes a sentence and then calls a tool (`flutter_edge_ai`
+2.4.0). The sentence streams as `TextResponse` — clear what you collected when
+`onToolCall` runs if only the final answer should remain, as
+`flutter_edge_ai_agent` does — but the chat's history keeps only the call
+(`role` and `tool_calls`), not the sentence. Without
+`supportsFunctionCalls: true`, or with `toolChoice: ToolChoice.none`, the call
+is not parsed and its JSON stays in the text.
+
+This is the same driver the voice loop uses: `VoiceSession.fromChat(…, onToolCall:)`
+runs function calls inside a spoken turn through it (see
+[Speech → Tool calling in the voice loop](/docs/speech#tool-calling-in-the-voice-loop)).
+
+### Tool calls in a saved history
+
+`chat.fullHistory` records each call as a `Message.toolCall` whose `toolCalls`
+hold the calls and whose `text` is what text engines replay: the model's output
+as the engine returned it — for a LiteRT-LM call, its `tool_calls` objects
+without the prose written before them. To restore a conversation with
+`clearHistory(replayHistory:)`, keep both, and `toolCallId` on each
+`Message.toolResponse`. A message you build yourself takes the calls alone, and
+the text formats read its text back if the model answers in that shape:
+
+```dart
+Message.toolCall(calls: [
+  FunctionCallResponse(name: 'change_background_color', args: {'color': 'blue'}, id: 'call_1'),
+]);
+// text: {"tool_calls":[{"id":"call_1","name":"change_background_color","arguments":{"color":"blue"}}]}
+```
+
+A history saved with `text` alone still replays: the calls are read back from
+it. One exception: on the web, a Gemma 4 call's text no longer marks its string
+arguments, so read back from text alone it has none — keep `toolCalls`.
+
+`MessageTranscriptCodec` saves both fields, and `toolCallId`, as JSON; see
+[Getting started → Saving a conversation](/docs/getting-started#saving-a-conversation).
+
+## Platform support
+
+Function calling is supported on **Android, iOS, Web, and Desktop**. For Gemma 4,
+the native function-call tokens are routed through the LiteRT-LM SDK chat-template
+path (use `ModelType.gemma4`), so Gemma 4 function calling needs a `.litertlm`
+model: with MediaPipe `.task` (including the web `-web.task` builds) and with ONNX
+the tools do not reach a Gemma 4 model. See [Capabilities](/docs/capabilities).
+
+With the [Built-in AI](/docs/builtin-ai) engine (`flutter_edge_ai_builtin_ai`)
+function calling is prompt-based rather than a native tool API — Gemini Nano
+(Android), Apple Foundation Models (iOS/macOS), and Phi Silica (Windows) handle
+single-turn tool calls; on Web multi-turn agent chaining is not supported. Tool
+declarations are deliberately not handed to the OS runner as well, which would
+run two competing tool loops for one turn. Apple's *native* tool calling stays
+reachable through `flutter_local_ai`'s own `LocalAiSession` API, outside
+flutter_edge_ai's chat loop.
+
+<Warning>
+
+Function calling works on the web `.litertlm` path, with one upstream caveat:
+constrained decoding is left off there ([LiteRT-LM#2434](https://github.com/google-ai-edge/LiteRT-LM/issues/2434)
+aborts the next turn after a tool call when it is on), so the call's JSON shape
+is not grammar-enforced. See [Troubleshooting](/docs/troubleshooting).
+
+</Warning>
+
+See [Models](/docs/models#modeltype-reference) for the correct `ModelType` per
+model family.
+
+**Writing this with a coding assistant?** `dart run skills@ get --all` installs [`flutter-edge-ai-function-calling`](/docs/package-skills), the skill that teaches it declaring tools, handling `FunctionCallResponse`, and the built-in tool loop.

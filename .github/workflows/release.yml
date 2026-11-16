@@ -25,7 +25,9 @@ jobs:
         uses: actions/setup-java@v4
         with:
           distribution: 'zulu'
-          java-version: '17'
+          # AGP 9.3's lint calls java.util.List.removeLast() (Java 21) and
+          # crashes on 17 in lintVitalAnalyzeRelease.
+          java-version: '21'
           cache: 'gradle'
 
       - name: Get version from tag
@@ -33,20 +35,21 @@ jobs:
         run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
 
       - name: Install plugin dependencies
+        working-directory: packages/flutter_edge_ai
         run: flutter pub get
 
       - name: Install example dependencies
-        working-directory: example
+        working-directory: packages/flutter_edge_ai/example
         run: flutter pub get
 
       - name: Build example APK (release)
-        working-directory: example
+        working-directory: packages/flutter_edge_ai/example
         run: flutter build apk --release
 
       - name: Rename APK with version
         run: |
-          mv example/build/app/outputs/flutter-apk/app-release.apk \
-             example/build/app/outputs/flutter-apk/flutter-gemma-example-v${{ steps.version.outputs.VERSION }}.apk
+          mv packages/flutter_edge_ai/example/build/app/outputs/flutter-apk/app-release.apk \
+             packages/flutter_edge_ai/example/build/app/outputs/flutter-apk/flutter-edge-ai-example-v${{ steps.version.outputs.VERSION }}.apk
 
       - name: Create GitHub Release
         id: create_release
@@ -58,13 +61,13 @@ jobs:
           prerelease: false
           generate_release_notes: true
           files: |
-            example/build/app/outputs/flutter-apk/flutter-gemma-example-v${{ steps.version.outputs.VERSION }}.apk
+            packages/flutter_edge_ai/example/build/app/outputs/flutter-apk/flutter-edge-ai-example-v${{ steps.version.outputs.VERSION }}.apk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: flutter-gemma-example-v${{ steps.version.outputs.VERSION }}
-          path: example/build/app/outputs/flutter-apk/flutter-gemma-example-v${{ steps.version.outputs.VERSION }}.apk
+          name: flutter-edge-ai-example-v${{ steps.version.outputs.VERSION }}
+          path: packages/flutter_edge_ai/example/build/app/outputs/flutter-apk/flutter-edge-ai-example-v${{ steps.version.outputs.VERSION }}.apk
           retention-days: 90

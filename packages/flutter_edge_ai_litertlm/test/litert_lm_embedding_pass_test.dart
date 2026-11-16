@@ -1,0 +1,3880 @@
+// The EmbeddingGemma 2 `.litertlm` pass over FAKE LiteRT-LM bindings (R5
+// §4.8, §4.10, D21-D23): what it reads from ModelInfo and when, what it hands
+// the settings, how a native failure becomes a typed exception, and that every
+// native object and every Dart allocation it makes is freed on every path —
+// success, and failure at each step.
+//
+// The fake extends the generated bindings with a lookup that throws, so a call
+// the fake does not model fails the test instead of reaching a native library.
+
+// ignore_for_file: non_constant_identifier_names
+
+import 'dart:async';
+import 'dart:convert';
+import 'dart:ffi';
+import 'dart:io';
+import 'dart:typed_data';
+
+import 'package:ffi/ffi.dart';
+import 'package:flutter/foundation.dart' show debugPrint;
+import 'package:flutter_edge_ai/engine.dart';
+import 'package:flutter_edge_ai_litertlm/flutter_edge_ai_litertlm.dart'
+    show LiteRtEmbedders;
+import 'package:flutter_edge_ai_litertlm/src/catalog/litert_catalog.dart'
+    show debugLiteRtCatalogHost;
+import 'package:flutter_edge_ai_litertlm/src/embedding/embedding_parts.dart';
+import 'package:flutter_edge_ai_litertlm/src/embedding/litert_lm_embedding_pass.dart';
+import 'package:flutter_edge_ai_litertlm/src/embedding/litertlm_container_io.dart';
+import 'package:flutter_edge_ai_litertlm/src/embedding/litertlm_npu_target.dart';
+import 'package:flutter_edge_ai_litertlm/src/ffi/litert_lm_embedding_bindings.dart';
+import 'package:flutter_test/flutter_test.dart';
+
+const _file = 'eg2.litertlm';
+const _noAudioEncoder =
+    '$_file has no audio encoder; install embeddinggemma-2-740m';
+const _allSignatures = [128, 256, 512, 1024, 2048, 8192];
+
+/// What a per-SoC bundle declares (measured: 128-1024, no 2048/8192).
+const _npuSignatures = [128, 256, 512, 1024];
+const _sm8850 = LiteRtLmNpuTarget(vendor: 'Qualcomm', soc: 'SM8850');
+const _ptl = LiteRtLmNpuTarget(vendor: 'IntelOpenVINO', soc: 'PTL');
+const _dispatchDir = '/data/app/code_cache/litert_npu';
+
+/// What LiteRT-LM's stb decoder handles (X3, measured on our dylib).
+final _imageFormats = {
+  EncodedMediaFormat.jpeg,
+  EncodedMediaFormat.png,
+  EncodedMediaFormat.gif,
+  EncodedMediaFormat.bmp,
+};
+
+/// What LiteRT-LM's miniaudio decoder handles (measured on the 740m).
+final _audioFormats = {
+  EncodedMediaFormat.wav,
+  EncodedMediaFormat.mp3,
+  EncodedMediaFormat.flac,
+};
+
+/// The container headers of real bundles (test/ffi/fixtures/README.md): the
+/// pass reads the section table for audio support (D23).
+const _header440m = 'test/ffi/fixtures/embeddinggemma2_440m_header.litertlm';
+const _header740m = 'test/ffi/fixtures/embeddinggemma2_740m_header.litertlm';
+
+/// The start of a WAV file: not valid UTF-8 past the header, so a pass that
+/// sent it as text would fail loudly in the fake.
+final _wav = Uint8List.fromList([
+  ...'RIFF'.codeUnits, 0x24, 0, 0, 0, ...'WAVE'.codeUnits, //
+  0xFF, 0xFE, 0x80, 0x81,
+]);
+
+/// The start of a PNG: enough for the sniff, and not valid UTF-8, so a pass
+/// that sent it as text would fail loudly in the fake.
+final _png = Uint8List.fromList([
+  0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, //
+  0x00, 0x00, 0x00, 0x0D, 0xFF, 0xFE, 0x80, 0x81,
+]);
+
+void main() {
+  late Directory root;
+  late String modelPath;
+  late String cacheBase;
+  late _FakeLiteRtLm native;
+  late _CountingAllocator allocator;
+
+  setUp(() {
+    root = Directory.systemTemp.createTempSync('eg2_pass_test_');
+    modelPath = '${root.path}/models/$_file';
+    File(modelPath)
+      ..createSync(recursive: true)
+      ..writeAsBytesSync(List.filled(37, 7));
+    cacheBase = '${root.path}/cache/flutter_edge_ai/emb';
+    native = _FakeLiteRtLm();
+    allocator = _CountingAllocator();
+  });
+
+  tearDown(() {
+    native.dispose();
+    root.deleteSync(recursive: true);
+  });
+
+  LiteRtLmEmbeddingPass pass({
+    Set<EmbeddingModality> declaredMedia = const {},
+    int? numThreads,
+    int visionTokensPerImage = 140,
+    bool requireWeightCache = false,
+    LiteRtLmEmbeddingBindings Function()? openBindings,
+    DateTime Function()? clock,
+    LiteRtLmNpuTarget? npuTarget,
+    String npuDispatchDir = _dispatchDir,
+    bool gpu = false,
+    bool visionTowerOnCpu = false,
+    bool audioTowerOnCpu = false,
+  }) => LiteRtLmEmbeddingPass(
+    LiteRtLmEmbeddingConfig(
+      modelPath: modelPath,
+      cacheBase: cacheBase,
+      declaredMedia: declaredMedia,
+      numThreads: numThreads,
+      visionTokensPerImage: visionTokensPerImage,
+      requireWeightCache: requireWeightCache,
+      npuTarget: npuTarget,
+      npuDispatchDir: npuTarget == null ? null : npuDispatchDir,
+      gpu: gpu,
+      visionTowerOnCpu: visionTowerOnCpu,
+      audioTowerOnCpu: audioTowerOnCpu,
+    ),
+    openBindings: openBindings ?? () => native,
+    allocator: allocator,
+    clock: clock,
+  );
+
+  /// A clock an hour ahead: every directory made so far is older than the
+  /// 10-minute grace.
+  DateTime anHourLater() => DateTime.now().add(const Duration(hours: 1));
+
+  String expectedCacheDir() {
+    final stat = File(modelPath).statSync();
+    return '$cacheBase/${liteRtLmCacheDirPrefix(_file)}-'
+        '${stat.size.toRadixString(36)}-'
+        '${stat.modified.millisecondsSinceEpoch.toRadixString(36)}';
+  }
+
+  /// Every native object created was deleted, and every Dart allocation freed.
+  void expectNothingLeaked() {
+    expect(native.live, isEmpty, reason: 'native objects still alive');
+    expect(allocator.live, 0, reason: 'leaked ${allocator.live} pointer(s)');
+  }
+
+  group('load', () {
+    test(
+      'reads ModelInfo, frees it, then settings → engine → options',
+      () async {
+        final info = await pass().load();
+
+        expect(info.dimension, 4);
+        expect(info.modalities, {EmbeddingModality.text});
+        expect(info.maxInputTokens, 1024);
+        expect(info.imageFormats, isEmpty);
+        expect(info.audioFormats, isEmpty);
+        expect(
+          info.combinedInputs,
+          isTrue,
+          reason: 'one vector may carry text, images and audio together',
+        );
+
+        expect(native.loadedPath, modelPath);
+        expect(
+          native.order,
+          containsAllInOrder([
+            'loaded_file_create',
+            'loaded_file_delete',
+            'settings_create',
+            'settings_set_cache_dir',
+            'settings_set_max_input_length',
+            'engine_create',
+            'settings_delete',
+            'options_create',
+          ]),
+          reason:
+              'ModelInfo is read and freed before any settings exist, and '
+              'the settings are freed right after the engine copied them',
+        );
+        expect(native.settingsModelPath, modelPath);
+        expect(native.settingsBackend, 'cpu');
+        expect(
+          native.towerBackendsNull,
+          isTrue,
+          reason:
+              'NULL tower backends: present towers run on the main '
+              'backend, and "cpu" for an absent one fails create (D26)',
+        );
+        expect(native.live.keys, unorderedEquals(['engine', 'options']));
+        expect(allocator.live, 0);
+      },
+    );
+
+    test(
+      'the settings always get the engine-owned cache dir and 1024',
+      () async {
+        await pass().load();
+        expect(native.cacheDir, expectedCacheDir());
+        expect(Directory(expectedCacheDir()).existsSync(), isTrue);
+        expect(native.maxInputLength, 1024);
+      },
+    );
+
+    test('options: normalize and special tokens on, overflow kTruncate (the '
+        'P3 gate: exact counts from the response), no output size', () async {
+      await pass().load();
+      expect(native.normalize, isTrue);
+      expect(native.insertSpecialTokens, isTrue);
+      expect(
+        native.overflowStrategy,
+        LiteRtLmInputOverflowStrategy.kLiteRtLmInputOverflowStrategyTruncate,
+      );
+      expect(native.order, isNot(contains('options_set_output_size')));
+    });
+
+    test('the overflow strategy values are the header\'s 0/1/2', () {
+      expect(
+        LiteRtLmInputOverflowStrategy
+            .kLiteRtLmInputOverflowStrategyChunkAndAverage
+            .value,
+        0,
+      );
+      expect(
+        LiteRtLmInputOverflowStrategy
+            .kLiteRtLmInputOverflowStrategyTruncate
+            .value,
+        1,
+      );
+      expect(
+        LiteRtLmInputOverflowStrategy.kLiteRtLmInputOverflowStrategyError.value,
+        2,
+      );
+    });
+
+    test('threads are set only when the config asks', () async {
+      await pass().load();
+      expect(native.order, isNot(contains('settings_set_num_threads')));
+
+      native.dispose();
+      native = _FakeLiteRtLm();
+      await pass(numThreads: 2).load();
+      expect(native.numThreads, 2);
+    });
+
+    group('maxInputTokens is the smallest text signature at or above the '
+        'setting (1024, or the largest signature below it)', () {
+      for (final (signatures, setting, max) in [
+        (_allSignatures, 1024, 1024),
+        ([8192, 128, 2048, 512, 1024, 256], 1024, 1024),
+        ([128, 256, 2048], 1024, 2048),
+        ([128, 256, 512], 512, 512),
+        ([4096], 1024, 4096),
+      ]) {
+        test('$signatures → setting $setting, maxInputTokens $max', () async {
+          native.textSignatures = signatures;
+          final info = await pass().load();
+          expect(native.maxInputLength, setting);
+          expect(info.maxInputTokens, max);
+        });
+      }
+    });
+
+    group('refused from ModelInfo, before any settings or engine', () {
+      Future<void> expectRefusal(Object message, {int? nativeCode}) async {
+        final p = pass();
+        await expectLater(
+          p.load(),
+          throwsA(
+            isA<EmbeddingLoadException>()
+                .having((e) => e.engine, 'engine', 'LiteRT-LM')
+                .having((e) => e.message, 'message', message)
+                .having((e) => e.nativeCode, 'nativeCode', nativeCode),
+          ),
+        );
+        expect(native.created('settings'), 0);
+        expect(native.created('engine'), 0);
+        expectNothingLeaked();
+        await p.close();
+        expectNothingLeaked();
+      }
+
+      test('an LLM bundle', () async {
+        native.modelType = LiteRtLmModelType.kLiteRtLmModelTypeLlm;
+        await expectRefusal(
+          startsWith(
+            '$_file is an LLM bundle, not an '
+            'embedder',
+          ),
+        );
+      });
+
+      test('a bundle of unknown type', () async {
+        native.modelType = LiteRtLmModelType.kLiteRtLmModelTypeUnknown;
+        await expectRefusal(contains('not a LiteRT-LM embedding bundle'));
+      });
+
+      test('no dimension', () async {
+        native.dimension = -1;
+        await expectRefusal(contains('dimension'));
+      });
+
+      test('no text signature', () async {
+        native.textSignatures = null;
+        await expectRefusal(contains('text signature'));
+        native.textSignatures = const [];
+        await expectRefusal(contains('text signature'));
+      });
+
+      test('an unreadable file: the native code and message', () async {
+        native.failLoadedFile = (code: 5, message: 'No such file: x');
+        await expectRefusal(
+          allOf(contains(_file), contains('No such file: x')),
+          nativeCode: 5,
+        );
+        expect(native.created('loaded_file'), 0);
+      });
+    });
+
+    group('capabilities come from the vision signatures (D23)', () {
+      Future<void> expectMediaRefusal(
+        Set<EmbeddingModality> declared,
+        Object message, {
+        int visionTokensPerImage = 140,
+      }) async {
+        final p = pass(
+          declaredMedia: declared,
+          visionTokensPerImage: visionTokensPerImage,
+        );
+        await expectLater(
+          p.load(),
+          throwsA(
+            isA<EmbeddingLoadException>()
+                .having((e) => e.engine, 'engine', 'LiteRT-LM')
+                .having((e) => e.message, 'message', message),
+          ),
+        );
+        expect(
+          native.created('settings'),
+          0,
+          reason: 'refused from ModelInfo: no engine, so no tower cache',
+        );
+        expect(
+          Directory(cacheBase).existsSync(),
+          isFalse,
+          reason: 'refused before the cache directory exists',
+        );
+        expectNothingLeaked();
+        await p.close();
+      }
+
+      test('images on a bundle without vision signatures name the 440m '
+          'bundle', () async {
+        native.visionSignatures = null; // -1, as the 270m reports
+        await expectMediaRefusal(
+          {EmbeddingModality.image},
+          '$_file has no vision encoder; install '
+          'embeddinggemma-2-text-vision-440m',
+        );
+        native.visionSignatures = const []; // an empty list: no tower either
+        await expectMediaRefusal({
+          EmbeddingModality.image,
+        }, contains('has no vision encoder'));
+      });
+
+      test('images on a bundle with vision: text and images, the formats '
+          'stb decodes, and the budget handed to the settings', () async {
+        native.visionSignatures = const [70, 140];
+        final info = await pass(
+          declaredMedia: {EmbeddingModality.image},
+        ).load();
+        expect(info.modalities, {
+          EmbeddingModality.text,
+          EmbeddingModality.image,
+        });
+        expect(info.imageFormats, _imageFormats);
+        expect(info.audioFormats, isEmpty);
+        expect(info.combinedInputs, isTrue);
+        expect(native.visionTokensPerImage, 140);
+        expect(info.visionTokensPerImage, 140, reason: 'reported to core');
+        expect(
+          native.order,
+          containsAllInOrder([
+            'settings_create',
+            'settings_set_vision_tokens_per_image',
+            'engine_create',
+          ]),
+          reason: 'the budget is a setting the engine copies at create',
+        );
+        expect(native.towerBackendsNull, isTrue, reason: 'D26: NULL towers');
+      });
+
+      test('70 is the opt-in budget', () async {
+        native.visionSignatures = const [70, 140];
+        final info = await pass(
+          declaredMedia: {EmbeddingModality.image},
+          visionTokensPerImage: 70,
+        ).load();
+        expect(native.visionTokensPerImage, 70);
+        expect(info.visionTokensPerImage, 70);
+      });
+
+      test('a budget the bundle has no vision signature for is refused from '
+          'ModelInfo, naming the ones it has', () async {
+        native.visionSignatures = const [140];
+        await expectMediaRefusal(
+          {EmbeddingModality.image},
+          allOf(contains(_file), contains('70'), contains('140')),
+          visionTokensPerImage: 70,
+        );
+      });
+
+      test('audio on a bundle without an audio encoder (the 440m container, '
+          'whose ModelInfo claims audio) names the 740m bundle', () async {
+        File(_header440m).copySync(modelPath);
+        native.visionSignatures = const [70, 140];
+        await expectMediaRefusal({EmbeddingModality.audio}, _noAudioEncoder);
+        await expectMediaRefusal({
+          EmbeddingModality.image,
+          EmbeddingModality.audio,
+        }, _noAudioEncoder);
+      });
+
+      test('audio on a bundle with an audio encoder (the 740m container): '
+          'text, images and audio, the formats miniaudio decodes, combined '
+          'inputs', () async {
+        File(_header740m).copySync(modelPath);
+        native.visionSignatures = const [70, 140];
+        final info = await pass(
+          declaredMedia: {EmbeddingModality.image, EmbeddingModality.audio},
+        ).load();
+        expect(info.modalities, {
+          EmbeddingModality.text,
+          EmbeddingModality.image,
+          EmbeddingModality.audio,
+        });
+        expect(info.imageFormats, _imageFormats);
+        expect(info.audioFormats, _audioFormats);
+        expect(info.combinedInputs, isTrue);
+        expect(native.towerBackendsNull, isTrue, reason: 'D26: NULL towers');
+
+        native.dispose();
+        native = _FakeLiteRtLm()..visionSignatures = const [70, 140];
+        final audioOnly = await pass(
+          declaredMedia: {EmbeddingModality.audio},
+        ).load();
+        expect(audioOnly.modalities, {
+          EmbeddingModality.text,
+          EmbeddingModality.image,
+          EmbeddingModality.audio,
+        });
+        expect(
+          native.order,
+          isNot(contains('settings_set_vision_tokens_per_image')),
+          reason: 'images were not declared',
+        );
+      });
+
+      test('a container it cannot read, with audio declared, is a load '
+          'failure — never "no audio" — before anything is created', () async {
+        // modelPath holds 37 bytes of 7s: ModelInfo is faked, the container
+        // is real and has no LITERTLM magic.
+        await expectMediaRefusal(
+          {EmbeddingModality.audio},
+          allOf(
+            contains('could not read the container of $_file'),
+            contains('LITERTLM'),
+          ),
+        );
+      });
+
+      test('the container is read only when audio is declared: a text or '
+          'image load never depends on it', () async {
+        // The same unreadable container as above.
+        native.visionSignatures = const [70, 140];
+        final info = await pass(
+          declaredMedia: {EmbeddingModality.image},
+        ).load();
+        expect(info.modalities, {
+          EmbeddingModality.text,
+          EmbeddingModality.image,
+        });
+        expect(info.audioFormats, isEmpty);
+      });
+
+      test('the audio formats are the ones measured decoding: Ogg and M4A '
+          'fail in miniaudio, so core refuses them before sending', () {
+        expect(liteRtLmAudioFormats, _audioFormats);
+        expect(liteRtLmAudioFormats, isNot(contains(EncodedMediaFormat.ogg)));
+        expect(liteRtLmAudioFormats, isNot(contains(EncodedMediaFormat.m4a)));
+      });
+
+      test('a vision bundle used for text only: the engine still reports '
+          'images (core keeps the model at what was declared), and the budget '
+          'is not set', () async {
+        native.visionSignatures = const [70, 140];
+        final info = await pass().load();
+        expect(info.modalities, {
+          EmbeddingModality.text,
+          EmbeddingModality.image,
+        });
+        expect(info.imageFormats, _imageFormats);
+        expect(
+          native.order,
+          isNot(contains('settings_set_vision_tokens_per_image')),
+        );
+        expect(info.visionTokensPerImage, isNull, reason: 'none was set');
+      });
+
+      test('a text-only bundle reports text, and no formats', () async {
+        native.visionSignatures = null;
+        final info = await pass().load();
+        expect(info.modalities, {EmbeddingModality.text});
+        expect(info.imageFormats, isEmpty);
+      });
+
+      test('the formats are the ones X3 measured decoding: WebP, TIFF and '
+          'HEIC are not among them, so core refuses them before sending', () {
+        expect(liteRtLmImageFormats, _imageFormats);
+        for (final refused in [
+          EncodedMediaFormat.webp,
+          EncodedMediaFormat.tiff,
+          EncodedMediaFormat.heic,
+          EncodedMediaFormat.avif,
+        ]) {
+          expect(liteRtLmImageFormats, isNot(contains(refused)));
+        }
+      });
+    });
+
+    group('a failure at each step frees everything created before it', () {
+      test('the library does not open', () async {
+        final p = pass(openBindings: () => throw ArgumentError('dlopen: gone'));
+        await expectLater(
+          p.load(),
+          throwsA(
+            isA<EmbeddingLoadException>()
+                .having((e) => e.engine, 'engine', 'LiteRT-LM')
+                .having((e) => e.cause, 'cause', isA<ArgumentError>()),
+          ),
+        );
+        await p.close();
+        expect(native.order, isEmpty);
+        expectNothingLeaked();
+      });
+
+      test('settings_create', () async {
+        native.failSettings = (code: 3, message: 'bad model file');
+        final p = pass();
+        await expectLater(
+          p.load(),
+          throwsA(
+            isA<EmbeddingLoadException>()
+                .having((e) => e.nativeCode, 'nativeCode', 3)
+                .having((e) => e.message, 'message', contains('bad model file'))
+                .having(
+                  (e) => e.message,
+                  'message',
+                  isNot(contains('cache directory')),
+                ),
+          ),
+        );
+        expectNothingLeaked();
+        await p.close();
+        expectNothingLeaked();
+      });
+
+      test(
+        'engine_create with code 3: the cache dir, not an overflow',
+        () async {
+          native.failEngine = (code: 3, message: 'cannot write cache');
+          final p = pass();
+          await expectLater(
+            p.load(),
+            throwsA(
+              isA<EmbeddingLoadException>()
+                  .having((e) => e.nativeCode, 'nativeCode', 3)
+                  .having(
+                    (e) => e.message,
+                    'message',
+                    allOf(
+                      contains(
+                        'embedding cache directory ${expectedCacheDir()}',
+                      ),
+                      contains('not writable'),
+                      contains('cannot write cache'),
+                    ),
+                  ),
+            ),
+          );
+          expect(native.deleted('settings'), 1);
+          expectNothingLeaked();
+          await p.close();
+          expectNothingLeaked();
+        },
+      );
+
+      test('engine_create with another code', () async {
+        native.failEngine = (code: 13, message: 'tensor alloc failed');
+        final p = pass();
+        await expectLater(
+          p.load(),
+          throwsA(
+            isA<EmbeddingLoadException>()
+                .having((e) => e.nativeCode, 'nativeCode', 13)
+                .having(
+                  (e) => e.message,
+                  'message',
+                  allOf(
+                    contains('tensor alloc failed'),
+                    isNot(contains('cache directory')),
+                  ),
+                ),
+          ),
+        );
+        expectNothingLeaked();
+        await p.close();
+        expectNothingLeaked();
+      });
+
+      test('engine_create returning NULL with nothing reported is not the '
+          'cache dir, whatever an earlier call left', () async {
+        // Left on the thread after the settings were made: a setter that
+        // reported something (upstream main's setters return statuses).
+        native
+          ..errorFromSetter = (code: 3, message: 'left by a setter')
+          ..silentNullEngine = true;
+        final p = pass();
+        await expectLater(
+          p.load(),
+          throwsA(
+            isA<EmbeddingLoadException>()
+                .having((e) => e.nativeCode, 'nativeCode', isNull)
+                .having(
+                  (e) => e.message,
+                  'message',
+                  isNot(contains('cache directory')),
+                ),
+          ),
+        );
+        expectNothingLeaked();
+        await p.close();
+      });
+
+      test('a setting setter that returns a status other than OK: an '
+          'EmbeddingLoadException naming the call, nothing created after '
+          'it, the settings deleted', () async {
+        native.failSetter = (code: 3, message: 'max_input_length too large');
+        final p = pass();
+        await expectLater(
+          p.load(),
+          throwsA(
+            isA<EmbeddingLoadException>()
+                .having((e) => e.nativeCode, 'nativeCode', 3)
+                .having(
+                  (e) => e.message,
+                  'message',
+                  allOf(
+                    contains(
+                      'litert_lm_embedding_engine_settings_set_max_input_length',
+                    ),
+                    contains('INVALID_ARGUMENT'),
+                    contains('max_input_length too large'),
+                  ),
+                ),
+          ),
+        );
+        expect(native.created('engine'), 0);
+        expect(native.deleted('settings'), 1);
+        expectNothingLeaked();
+        await p.close();
+      });
+
+      for (final getter in [
+        'model_type',
+        'embedding_dimension',
+        'embedding_signature_selection',
+      ]) {
+        test('a ModelInfo $getter that fails (not NOT_FOUND) refuses the load '
+            'naming it, never taken for a value the file lacks', () async {
+          native.failModelInfo = (getter: getter, code: 13);
+          final p = pass();
+          await expectLater(
+            p.load(),
+            throwsA(
+              isA<EmbeddingLoadException>()
+                  .having((e) => e.nativeCode, 'nativeCode', 13)
+                  .having(
+                    (e) => e.message,
+                    'message',
+                    allOf(
+                      contains(
+                        'litert_lm_loaded_file_$getter failed with '
+                        'INTERNAL',
+                      ),
+                      contains('$getter broke'),
+                    ),
+                  ),
+            ),
+          );
+          expect(native.created('engine'), 0);
+          expectNothingLeaked();
+          await p.close();
+        });
+      }
+
+      test('options_create', () async {
+        native.failOptions = true;
+        final p = pass();
+        await expectLater(p.load(), throwsA(isA<EmbeddingLoadException>()));
+        expect(native.deleted('engine'), 1);
+        expectNothingLeaked();
+        await p.close();
+        expectNothingLeaked();
+      });
+    });
+
+    group('the engine-owned cache directory (D22)', () {
+      test(
+        'is created, and the caches of earlier copies of the same file name '
+        '(a re-download, a new revision under the same name) are deleted',
+        () async {
+          final ours = liteRtLmCacheDirPrefix(_file);
+          final size = File(modelPath).lengthSync();
+          final staleDirs = [
+            Directory('$cacheBase/$ours-1-2'), // other size and time
+            Directory('$cacheBase/$ours-2q0ikg-mv4esplh'), // base 36 letters
+            // Same size, older time.
+            Directory('$cacheBase/$ours-${size.toRadixString(36)}-2'),
+          ];
+          for (final stale in staleDirs) {
+            stale.createSync(recursive: true);
+            File('${stale.path}/old.xnnpack_cache').writeAsStringSync('x');
+          }
+          final kept = [
+            Directory(
+              '$cacheBase/${liteRtLmCacheDirPrefix('other.litertlm')}-1-2',
+            ),
+            Directory('$cacheBase/$ours-ABC-2'),
+            Directory('$cacheBase/$ours-a_b-2'),
+            Directory('$cacheBase/$ours-1-2-3'),
+            Directory('$cacheBase/x$ours-1-2'),
+            Directory('$cacheBase/$_file-1-2'),
+          ];
+          for (final dir in kept) {
+            dir.createSync(recursive: true);
+          }
+
+          await pass(clock: anHourLater).load();
+
+          expect(Directory(expectedCacheDir()).existsSync(), isTrue);
+          for (final stale in staleDirs) {
+            expect(stale.existsSync(), isFalse, reason: stale.path);
+          }
+          for (final dir in kept) {
+            expect(dir.existsSync(), isTrue, reason: '${dir.path} is not ours');
+          }
+        },
+      );
+
+      test('stale siblings go only after this pass\'s engine was created: a '
+          'failed create deletes nothing', () async {
+        final stale = Directory(
+          '$cacheBase/${liteRtLmCacheDirPrefix(_file)}-1-2',
+        )..createSync(recursive: true);
+        native.failEngine = (code: 13, message: 'no engine');
+        final p = pass(clock: anHourLater);
+        await expectLater(p.load(), throwsA(isA<EmbeddingLoadException>()));
+        await p.close();
+        expect(stale.existsSync(), isTrue);
+
+        native.dispose();
+        native = _FakeLiteRtLm();
+        await pass(clock: anHourLater).load();
+        expect(stale.existsSync(), isFalse);
+      });
+
+      test('a sibling touched within the last 10 minutes is kept — another '
+          'process may be loading that copy', () async {
+        final ours = liteRtLmCacheDirPrefix(_file);
+        // Just made: its directory is fresh.
+        final fresh = Directory('$cacheBase/$ours-1-2')
+          ..createSync(recursive: true);
+        // Old directory, but an entry inside was written 5 minutes "ago".
+        final busy = Directory('$cacheBase/$ours-3-4')
+          ..createSync(recursive: true);
+        final clock = anHourLater();
+        File('${busy.path}/model.text_encoder.xnnpack_cache')
+          ..writeAsStringSync('being written')
+          ..setLastModifiedSync(clock.subtract(const Duration(minutes: 5)));
+
+        await pass().load(); // the real clock: `fresh` is seconds old
+        expect(fresh.existsSync(), isTrue);
+
+        await pass(clock: () => clock).load();
+        expect(fresh.existsSync(), isFalse, reason: 'an hour old by now');
+        expect(busy.existsSync(), isTrue, reason: 'its newest entry is fresh');
+      });
+
+      test('a sibling that will not delete is logged, not fatal, and does not '
+          'stop the others', () async {
+        final ours = liteRtLmCacheDirPrefix(_file);
+        final stuck = Directory('$cacheBase/$ours-1-2/locked')
+          ..createSync(recursive: true);
+        File('${stuck.path}/x').writeAsStringSync('x');
+        // Sorts after the stuck one, so it is tried after the failure.
+        final other = Directory('$cacheBase/$ours-5-6')
+          ..createSync(recursive: true);
+        Process.runSync('chmod', ['555', stuck.path]);
+        addTearDown(() => Process.runSync('chmod', ['755', stuck.path]));
+
+        final info = await pass(clock: anHourLater).load();
+        expect(info.dimension, 4);
+        expect(other.existsSync(), isFalse);
+      }, skip: Platform.isWindows ? 'chmod' : null);
+
+      test('is named <8-hex hash of the file name>-<base36 size>-<base36 '
+          'mtime ms>', () {
+        final name = liteRtLmCacheDirName(
+          _file,
+          size: 164626432,
+          modified: DateTime.fromMillisecondsSinceEpoch(1791758581397),
+        );
+        // 164626432 = 2q0ikg, 1791758581397 = mv4esplh in base 36.
+        expect(name, matches(RegExp(r'^[0-9a-f]{8}-2q0ikg-mv4esplh$')));
+        expect(name, hasLength(24));
+        expect(name, startsWith(liteRtLmCacheDirPrefix(_file)));
+        expect(
+          liteRtLmCacheDirPrefix('a.litertlm'),
+          isNot(liteRtLmCacheDirPrefix('b.litertlm')),
+        );
+      });
+
+      test('keeps the engine\'s cache file well under Windows MAX_PATH for '
+          'the example app', () {
+        // The engine names its file `<model>_<mtime s>_<size>.<graph>.xnnpack_cache`
+        // inside the directory; spelling the model's name in the directory
+        // too put this path at about 284 characters.
+        const model = 'embeddinggemma-2-text-270m__rev-9be6e8b90982.litertlm';
+        // getApplicationCacheDirectory() on Windows: %LOCALAPPDATA%\<company>
+        // \<product>.
+        const base =
+            r'C:\Users\a-twenty-char-user-x\AppData\Local\dev.flutterberlin'
+            r'\flutter_edge_ai_example\flutter_edge_ai\emb';
+        final dir = liteRtLmCacheDirName(
+          model,
+          size: 164626432,
+          modified: DateTime.fromMillisecondsSinceEpoch(1791758581397),
+        );
+        final file = '${model}_1791758581_164626432.text_encoder.xnnpack_cache';
+        final path = '$base\\$dir\\$file';
+        // 232 characters for the 270m's text tower: 28 to spare for a longer
+        // user, company or app folder (the 12-hex / decimal / embedding_cache
+        // form left 4). The longest the catalog offers on Windows is the next
+        // test's: 251, 9 to spare.
+        expect(path.length, 232);
+        expect(260 - path.length, greaterThanOrEqualTo(25));
+        // What the refusal and the warning report: this file's path, not the
+        // directory's (24 + 1 characters of directory below `base`).
+        expect(
+          liteRtLmCacheFilePathLength('$base\\$dir', model, 164626432),
+          path.length,
+        );
+      });
+
+      test('every EmbeddingGemma 2 build the catalog offers on Windows keeps '
+          'each tower\'s cache file under MAX_PATH', () {
+        const base =
+            r'C:\Users\a-twenty-char-user-x\AppData\Local\dev.flutterberlin'
+            r'\flutter_edge_ai_example\flutter_edge_ai\emb';
+        debugLiteRtCatalogHost = () => 'windows_x64';
+        addTearDown(() => debugLiteRtCatalogHost = null);
+        var longest = 0;
+        var worst = '';
+        var checked = 0;
+        for (final model in LiteRtEmbedders.all) {
+          for (final v in model.variants) {
+            if (!v.isBundle || v.backendsHere.isEmpty) continue;
+            final name = v.model.installFilename;
+            final dir = liteRtLmCacheDirName(
+              name,
+              size: v.model.sizeBytes,
+              modified: DateTime.fromMillisecondsSinceEpoch(1791758581397),
+            );
+            for (final tower in [
+              'text_encoder',
+              if (v.modalities.contains(EmbeddingModality.image))
+                'vision_encoder',
+              if (v.modalities.contains(EmbeddingModality.audio))
+                'streaming_audio_encoder',
+            ]) {
+              final file =
+                  '${name}_1791758581_${v.model.sizeBytes}.$tower.xnnpack_cache';
+              final length = '$base\\$dir\\$file'.length;
+              if (length > longest) {
+                longest = length;
+                worst = '$name, $tower';
+              }
+              checked++;
+            }
+          }
+        }
+        expect(checked, greaterThan(3));
+        // 251 characters, for the 440m Intel PTL bundle's vision tower: 9 to
+        // spare for a longer user, company or app folder name.
+        expect(longest, 251, reason: worst);
+        expect(worst, allOf(contains('440m_Intel_PTL'), contains('vision')));
+      });
+
+      test('the causes name MAX_PATH as the likely one on Windows from 260 '
+          'characters, and list every cause otherwise', () {
+        const everyCause = [
+          'a path too long for the platform',
+          'MAX_PATH is 260 characters',
+          'a directory this process cannot write to',
+          'no free space at all',
+        ];
+        for (final (length, windows) in [(259, true), (300, false)]) {
+          final causes = liteRtLmNoWeightCacheCauses(
+            cachePathLength: length,
+            windows: windows,
+          );
+          expect(causes, allOf([for (final c in everyCause) contains(c)]));
+          expect(causes, isNot(contains('the likely cause')));
+        }
+        for (final length in [260, 300]) {
+          expect(
+            liteRtLmNoWeightCacheCauses(cachePathLength: length, windows: true),
+            allOf(
+              contains("past Windows' 260-character MAX_PATH"),
+              contains('the likely cause'),
+              contains('a directory this process cannot write to'),
+              contains('no free space at all'),
+            ),
+          );
+        }
+      });
+
+      test('a real cache file is a *.xnnpack_cache of at least 1 MiB; a file '
+          'gone or unreadable by the time it is looked at is skipped, and the '
+          'files after it are still read', () {
+        final dir = Directory('${root.path}/scan')..createSync();
+        File sized(String name, int bytes) {
+          final file = File('${dir.path}/$name');
+          file.openSync(mode: FileMode.write)
+            ..truncateSync(bytes)
+            ..closeSync();
+          return file;
+        }
+
+        final entries = <FileSystemEntity>[
+          File('${dir.path}/gone.text_encoder.xnnpack_cache'), // never made
+          sized('m_1_2.vision_encoder.xnnpack_cache', 1 << 20),
+          sized('m_1_2.text_encoder.xnnpack_cache', (1 << 20) - 1),
+          sized('m_1_2.static_audio_encoder.xnnpack_cache', 100),
+          sized('m.mldrift_program_cache.bin', 2 << 20),
+          Directory('${dir.path}/sub.xnnpack_cache')..createSync(),
+        ];
+        expect(liteRtLmWrittenWeightCaches(entries), [
+          'm_1_2.vision_encoder.xnnpack_cache',
+        ]);
+        expect(liteRtLmMinWeightCacheBytes, 1 << 20);
+      });
+
+      test('an empty directory after create is reported, a filled one is '
+          'not', () async {
+        final filled = await _printsDuring(() => pass().load());
+        expect(filled.where((l) => l.contains('weight cache')), isEmpty);
+
+        native.dispose();
+        native = _FakeLiteRtLm()..writeCacheOnCreate = false;
+        Directory(expectedCacheDir()).deleteSync(recursive: true);
+        final empty = await _printsDuring(() => pass().load());
+        expect(
+          empty,
+          contains(
+            allOf([
+              contains('WARNING'),
+              contains('no weight cache'),
+              contains(expectedCacheDir()),
+              contains(
+                'about ${_textCachePath(expectedCacheDir()).length} '
+                'characters',
+              ),
+              contains('a directory this process cannot write to'),
+              contains('no free space at all'),
+              contains('requireWeightCache: true'),
+              isNot(contains('full disk')),
+              isNot(contains('native log')),
+            ]),
+          ),
+        );
+      });
+
+      test(
+        'without the flag, header-only files (a failed or partial header '
+        'write) are reported as no cache too, and the load goes on',
+        () async {
+          native.cacheFileBytes = 100;
+          final p = pass();
+          final lines = await _printsDuring(() async {
+            final info = await p.load();
+            expect(info.dimension, 4);
+          });
+          expect(_aboutWeightCache(lines), [
+            allOf(
+              contains('WARNING'),
+              contains('wrote no weight cache to ${expectedCacheDir()}'),
+            ),
+          ]);
+          expect(native.live['engine'], hasLength(1));
+          await p.close();
+          expectNothingLeaked();
+        },
+      );
+
+      test('requireWeightCache: an empty directory after create is a load '
+          'failure naming the directory, the length of the cache file path and '
+          'the likely causes; the engine is deleted, nothing is printed, and '
+          'the stale siblings are collected first', () async {
+        native.writeCacheOnCreate = false;
+        final stale = Directory(
+          '$cacheBase/${liteRtLmCacheDirPrefix(_file)}-1-2',
+        )..createSync(recursive: true);
+        final dir = expectedCacheDir();
+        final p = pass(requireWeightCache: true, clock: anHourLater);
+
+        final lines = await _printsDuring(
+          () => expectLater(
+            p.load(),
+            throwsA(
+              isA<EmbeddingLoadException>()
+                  .having((e) => e.engine, 'engine', 'LiteRT-LM')
+                  .having((e) => e.nativeCode, 'nativeCode', isNull)
+                  .having(
+                    (e) => e.message,
+                    'message',
+                    allOf([
+                      contains(
+                        'wrote no weight cache to $dir while loading $_file',
+                      ),
+                      contains(
+                        'about ${_textCachePath(dir).length} characters',
+                      ),
+                      contains('requireWeightCache: true'),
+                      contains('a path too long for the platform'),
+                      contains('MAX_PATH'),
+                      contains('a directory this process cannot write to'),
+                      contains('no free space at all'),
+                      isNot(contains('full disk')),
+                      isNot(contains('native log')),
+                    ]),
+                  ),
+            ),
+          ),
+        );
+
+        expect(
+          _aboutWeightCache(lines),
+          isEmpty,
+          reason: 'refused, not warned',
+        );
+        expect(native.created('engine'), 1);
+        expect(native.deleted('engine'), 1);
+        expect(native.deleted('options'), 1);
+        expectNothingLeaked();
+        expect(
+          stale.existsSync(),
+          isFalse,
+          reason:
+              'this refusal collects stale siblings: an older copy\'s cache '
+              'may be what left no free space',
+        );
+        expect(Directory(dir).existsSync(), isTrue, reason: 'ours is kept');
+        await p.close();
+        expectNothingLeaked();
+      });
+
+      test('requireWeightCache: header-only files (about 100 bytes, all a '
+          'failed write leaves) are no cache', () async {
+        native.cacheFileBytes = 100;
+        final dir = expectedCacheDir();
+        final p = pass(requireWeightCache: true);
+
+        await expectLater(
+          p.load(),
+          throwsA(
+            isA<EmbeddingLoadException>().having(
+              (e) => e.message,
+              'message',
+              contains('wrote no weight cache to $dir'),
+            ),
+          ),
+        );
+        expect(
+          Directory(dir).listSync().whereType<File>(),
+          isNotEmpty,
+          reason: 'the header-only files are there',
+        );
+        expect(native.deleted('engine'), 1);
+        await p.close();
+        expectNothingLeaked();
+      });
+
+      test('requireWeightCache: a large file that is not a *.xnnpack_cache '
+          'is no cache', () async {
+        native.writeCacheOnCreate = false;
+        final dir = Directory(expectedCacheDir())..createSync(recursive: true);
+        File(
+            '${dir.path}/eg2.litertlm.mldrift_program_cache.bin',
+          ).openSync(mode: FileMode.write)
+          ..truncateSync(4 << 20)
+          ..closeSync();
+        final p = pass(requireWeightCache: true);
+
+        await expectLater(
+          p.load(),
+          throwsA(
+            isA<EmbeddingLoadException>().having(
+              (e) => e.message,
+              'message',
+              contains('wrote no weight cache to ${dir.path}'),
+            ),
+          ),
+        );
+        await p.close();
+        expectNothingLeaked();
+      });
+
+      test(
+        'a tower whose cache is missing while another was written is a '
+        'printed warning naming it, never a refusal — with the flag too',
+        () async {
+          Future<List<String>> load({
+            required Set<String> omit,
+            Set<EmbeddingModality> declaredMedia = const {},
+            bool requireWeightCache = false,
+          }) async {
+            native.dispose();
+            native = _FakeLiteRtLm()
+              ..visionSignatures = const [70, 140]
+              ..omitTowerCaches = omit;
+            final dir = Directory(expectedCacheDir());
+            if (dir.existsSync()) dir.deleteSync(recursive: true);
+            final p = pass(
+              declaredMedia: declaredMedia,
+              requireWeightCache: requireWeightCache,
+            );
+            final lines = await _printsDuring(() async {
+              expect((await p.load()).dimension, 4);
+            });
+            await p.close();
+            expectNothingLeaked();
+            return _aboutWeightCache(lines).toList();
+          }
+
+          Matcher missing(String tower) => contains(
+            allOf(
+              contains('WARNING'),
+              contains('wrote no weight cache for '),
+              contains('the $tower tower'),
+              contains(expectedCacheDir()),
+              contains('a path too long for the platform'),
+            ),
+          );
+
+          // The vision tower is set up whatever was declared, so its cache is
+          // expected on a text-only load too.
+          expect(await load(omit: {}), isEmpty);
+          expect(await load(omit: {'vision_encoder'}), missing('vision'));
+          expect(
+            await load(omit: {'vision_encoder'}, requireWeightCache: true),
+            missing('vision'),
+          );
+          expect(await load(omit: {'text_encoder'}), missing('text'));
+
+          File(_header740m).copySync(modelPath);
+          final audio = {EmbeddingModality.audio};
+          expect(await load(omit: {}, declaredMedia: audio), isEmpty);
+          expect(
+            await load(omit: {'static_audio_encoder'}, declaredMedia: audio),
+            missing('audio'),
+          );
+          expect(
+            await load(
+              omit: {'static_audio_encoder', 'vision_encoder'},
+              declaredMedia: audio,
+              requireWeightCache: true,
+            ),
+            allOf(missing('vision'), missing('audio')),
+          );
+        },
+      );
+
+      test('requireWeightCache: a written cache loads as it does without the '
+          'flag', () async {
+        final p = pass(requireWeightCache: true);
+        final lines = await _printsDuring(() async {
+          final info = await p.load();
+          expect(info.dimension, 4);
+        });
+        expect(_aboutWeightCache(lines), isEmpty);
+        expect(native.live['engine'], hasLength(1));
+        expect(
+          await p.embed(EmbeddingInput.text('hello'), TaskType.retrievalQuery),
+          hasLength(4),
+        );
+        await p.close();
+        expectNothingLeaked();
+      });
+
+      test(
+        'a cache directory gone after create: without the flag the load '
+        'goes on with a warning, with it the cache is not taken as written',
+        () async {
+          native
+            ..writeCacheOnCreate = false
+            ..deleteCacheDirOnCreate = true;
+          final lenient = pass();
+          final lines = await _printsDuring(() => lenient.load());
+          expect(_aboutWeightCache(lines), [
+            allOf(
+              contains('WARNING'),
+              contains(
+                'could not check the weight cache LiteRT-LM was to write '
+                'to ${expectedCacheDir()}',
+              ),
+              contains('requireWeightCache: true'),
+            ),
+          ]);
+          await lenient.close();
+          expectNothingLeaked();
+
+          final stale = Directory(
+            '$cacheBase/${liteRtLmCacheDirPrefix(_file)}-1-2',
+          )..createSync(recursive: true);
+          final strict = pass(requireWeightCache: true, clock: anHourLater);
+          await expectLater(
+            strict.load(),
+            throwsA(
+              isA<EmbeddingLoadException>()
+                  .having((e) => e.cause, 'cause', isA<FileSystemException>())
+                  .having(
+                    (e) => e.message,
+                    'message',
+                    contains(
+                      'could not check the weight cache LiteRT-LM was to write '
+                      'to ${expectedCacheDir()}',
+                    ),
+                  ),
+            ),
+          );
+          expect(native.created('engine'), 2);
+          expect(native.deleted('engine'), 2);
+          expect(
+            stale.existsSync(),
+            isTrue,
+            reason: 'only the no-cache refusal collects siblings',
+          );
+          expectNothingLeaked();
+          await strict.close();
+        },
+      );
+
+      test('a path that cannot become a directory is a load failure, before '
+          'any settings', () async {
+        File(cacheBase)
+          ..createSync(recursive: true)
+          ..writeAsStringSync('a file where the cache base should be');
+        final p = pass();
+        await expectLater(
+          p.load(),
+          throwsA(
+            isA<EmbeddingLoadException>().having(
+              (e) => e.message,
+              'message',
+              contains('embedding cache directory'),
+            ),
+          ),
+        );
+        expect(native.created('settings'), 0);
+        expectNothingLeaked();
+        await p.close();
+      });
+    });
+  });
+
+  group('embed', () {
+    late LiteRtLmEmbeddingPass p;
+
+    setUp(() async {
+      p = pass();
+      await p.load();
+    });
+
+    tearDown(() => p.close());
+
+    test('sends taskType.prefix + text as ONE text part, for every '
+        'TaskType', () async {
+      for (final taskType in TaskType.values) {
+        final vector = await p.embed(
+          EmbeddingInput.text('Grüße, Welt 🌍'),
+          taskType,
+        );
+        expect(vector, native.lastVector);
+        expect(native.lastTexts, ['${taskType.prefix}Grüße, Welt 🌍']);
+        expect(native.lastPartTypes, [
+          LiteRtLmInputDataType.kLiteRtLmInputDataTypeText,
+        ]);
+      }
+      expect(native.live.keys, unorderedEquals(['engine', 'options']));
+      expect(allocator.live, 0);
+    });
+
+    test(
+      'empty text with no prefix is an empty part (BOS and EOS only)',
+      () async {
+        await p.embed(EmbeddingInput.text(''), TaskType.none);
+        expect(native.lastTexts, ['']);
+        expect(allocator.live, 0);
+      },
+    );
+
+    test('a truncated response is EmbeddingInputTooLongException with the '
+        'exact counts the response reports; the vector is never returned, '
+        'the response is deleted and the engine keeps working', () async {
+      native
+        ..responseInputLength = 2402
+        ..responseTruncatedLength = 1024;
+      await expectLater(
+        p.embed(EmbeddingInput.text('long'), TaskType.retrievalDocument),
+        throwsA(
+          isA<EmbeddingInputTooLongException>()
+              .having((e) => e.maxInputTokens, 'maxInputTokens', 1024)
+              .having((e) => e.actualTokens, 'actualTokens', 2402)
+              .having(
+                (e) => e.message,
+                'message',
+                allOf(contains('2402'), contains('1024'), contains(_file)),
+              ),
+        ),
+      );
+      expect(
+        native.order,
+        containsAllInOrder([
+          'compute_embedding',
+          'response_get_input_length',
+          'response_get_truncated_length',
+          'response_delete',
+        ]),
+      );
+      expect(native.order, isNot(contains('response_get_values')));
+      expect(native.live.keys, unorderedEquals(['engine', 'options']));
+      expect(allocator.live, 0);
+
+      native
+        ..responseInputLength = 12
+        ..responseTruncatedLength = 0;
+      expect(
+        await p.embed(EmbeddingInput.text('short'), TaskType.retrievalQuery),
+        native.lastVector,
+      );
+    });
+
+    test('code 3 is no longer an overflow (kTruncate returns a response for '
+        'one): EmbeddingEngineException(nativeCode 3)', () async {
+      native.failCompute = (code: 3, message: 'Some structural problem');
+      await expectLater(
+        p.embed(EmbeddingInput.text('x'), TaskType.retrievalDocument),
+        throwsA(
+          isA<EmbeddingEngineException>()
+              .having((e) => e.nativeCode, 'nativeCode', 3)
+              .having(
+                (e) => e.message,
+                'message',
+                contains('Some structural problem'),
+              ),
+        ),
+      );
+      expect(allocator.live, 0);
+    });
+
+    test('a count past the limit with nothing reported truncated is still an '
+        'overflow, against the limit read at load — never a vector', () async {
+      native
+        ..responseInputLength = 1500
+        ..responseTruncatedLength = 0;
+      await expectLater(
+        p.embed(EmbeddingInput.text('x'), TaskType.retrievalQuery),
+        throwsA(
+          isA<EmbeddingInputTooLongException>()
+              .having((e) => e.maxInputTokens, 'maxInputTokens', 1024)
+              .having((e) => e.actualTokens, 'actualTokens', 1500),
+        ),
+      );
+      native.responseInputLength = 1024; // exactly the limit: embedded
+      expect(
+        await p.embed(EmbeddingInput.text('x'), TaskType.retrievalQuery),
+        native.lastVector,
+      );
+      expect(native.live.keys, unorderedEquals(['engine', 'options']));
+      expect(allocator.live, 0);
+    });
+
+    test('a response without token counts (-1) is an engine failure, never '
+        'a vector', () async {
+      native.responseInputLength = -1;
+      await expectLater(
+        p.embed(EmbeddingInput.text('x'), TaskType.retrievalQuery),
+        throwsA(isA<EmbeddingEngineException>()),
+      );
+      native
+        ..responseInputLength = 12
+        ..responseTruncatedLength = -1;
+      await expectLater(
+        p.embed(EmbeddingInput.text('x'), TaskType.retrievalQuery),
+        throwsA(isA<EmbeddingEngineException>()),
+      );
+      expect(native.live.keys, unorderedEquals(['engine', 'options']));
+      expect(allocator.live, 0);
+    });
+
+    test('any other code is EmbeddingEngineException(nativeCode) with the '
+        'message read before any other native call', () async {
+      native.failCompute = (code: 13, message: 'Vision executor missing');
+      await expectLater(
+        p.embed(EmbeddingInput.text('x'), TaskType.retrievalQuery),
+        throwsA(
+          isA<EmbeddingEngineException>()
+              .having((e) => e.engine, 'engine', 'LiteRT-LM')
+              .having((e) => e.nativeCode, 'nativeCode', 13)
+              .having(
+                (e) => e.message,
+                'message',
+                contains('Vision executor missing'),
+              ),
+        ),
+      );
+      expect(native.live.keys, unorderedEquals(['engine', 'options']));
+      expect(allocator.live, 0);
+    });
+
+    test('a NULL that reports nothing is not read as an earlier failure on '
+        'this thread', () async {
+      native
+        ..setStaleError(3, 'an overflow from an earlier call')
+        ..silentNullCompute = true;
+      await expectLater(
+        p.embed(EmbeddingInput.text('x'), TaskType.retrievalQuery),
+        throwsA(
+          isA<EmbeddingEngineException>()
+              .having((e) => e.nativeCode, 'nativeCode', isNull)
+              .having(
+                (e) => e.message,
+                'message',
+                contains('no error reported'),
+              ),
+        ),
+      );
+    });
+
+    test('input_data_create returning NULL sets no native error: an engine '
+        'failure without a code', () async {
+      native.failInputData = true;
+      await expectLater(
+        p.embed(EmbeddingInput.text('x'), TaskType.retrievalQuery),
+        throwsA(
+          isA<EmbeddingEngineException>().having(
+            (e) => e.nativeCode,
+            'nativeCode',
+            isNull,
+          ),
+        ),
+      );
+      expect(native.order, isNot(contains('compute_embedding')));
+      expect(allocator.live, 0);
+    });
+
+    test('an image on a pass loaded without images never reaches the engine '
+        '(core refuses it first; reaching the pass is a host bug)', () async {
+      await expectLater(
+        p.embed(EmbeddingInput.image(_png), TaskType.none),
+        throwsA(isA<EmbeddingEngineException>()),
+      );
+      expect(native.order, isNot(contains('input_data_create')));
+      expect(allocator.live, 0);
+    });
+
+    test('a vector of the wrong size fails, and the response is still '
+        'deleted', () async {
+      native.responseSize = 3;
+      await expectLater(
+        p.embed(EmbeddingInput.text('x'), TaskType.retrievalQuery),
+        throwsA(isA<EmbeddingEngineException>()),
+      );
+      expect(native.live.keys, unorderedEquals(['engine', 'options']));
+      expect(allocator.live, 0);
+    });
+  });
+
+  group('embed an image', () {
+    late LiteRtLmEmbeddingPass p;
+
+    setUp(() async {
+      native.visionSignatures = const [70, 140];
+      p = pass(declaredMedia: {EmbeddingModality.image});
+      await p.load();
+    });
+
+    tearDown(() => p.close());
+
+    test('sends the encoded bytes as ONE image part, never a prefix, for '
+        'every TaskType', () async {
+      for (final taskType in TaskType.values) {
+        final vector = await p.embed(EmbeddingInput.image(_png), taskType);
+        expect(vector, native.lastVector);
+        expect(native.lastPartTypes, [
+          LiteRtLmInputDataType.kLiteRtLmInputDataTypeImage,
+        ]);
+        expect(native.lastParts.single, _png);
+      }
+      expect(native.live.keys, unorderedEquals(['engine', 'options']));
+      expect(allocator.live, 0);
+    });
+
+    test('text still works on the same pass', () async {
+      await p.embed(EmbeddingInput.text('a red circle'), TaskType.none);
+      expect(native.lastPartTypes, [
+        LiteRtLmInputDataType.kLiteRtLmInputDataTypeText,
+      ]);
+      expect(native.lastTexts, ['a red circle']);
+    });
+
+    test('code 3 on an image is a decode failure, never an overflow: '
+        'EmbeddingEngineException(nativeCode 3), and the engine keeps '
+        'working', () async {
+      native.failCompute = (code: 3, message: 'Failed to decode image');
+      await expectLater(
+        p.embed(EmbeddingInput.image(_png), TaskType.retrievalDocument),
+        throwsA(
+          isA<EmbeddingEngineException>()
+              .having((e) => e.engine, 'engine', 'LiteRT-LM')
+              .having((e) => e.nativeCode, 'nativeCode', 3)
+              .having(
+                (e) => e.message,
+                'message',
+                allOf(contains('decode'), contains('Failed to decode image')),
+              ),
+        ),
+      );
+      expect(native.live.keys, unorderedEquals(['engine', 'options']));
+      expect(allocator.live, 0);
+
+      native.failCompute = null;
+      expect(
+        await p.embed(EmbeddingInput.image(_png), TaskType.none),
+        native.lastVector,
+      );
+    });
+
+    test('any other code on an image is EmbeddingEngineException with that '
+        'code', () async {
+      native.failCompute = (code: 13, message: 'Vision executor missing');
+      await expectLater(
+        p.embed(EmbeddingInput.image(_png), TaskType.none),
+        throwsA(
+          isA<EmbeddingEngineException>()
+              .having((e) => e.nativeCode, 'nativeCode', 13)
+              .having(
+                (e) => e.message,
+                'message',
+                contains('Vision executor missing'),
+              ),
+        ),
+      );
+      expect(allocator.live, 0);
+    });
+
+    test('input_data_create returning NULL for an image: an engine failure '
+        'without a code, nothing computed', () async {
+      native.failInputData = true;
+      await expectLater(
+        p.embed(EmbeddingInput.image(_png), TaskType.none),
+        throwsA(
+          isA<EmbeddingEngineException>().having(
+            (e) => e.nativeCode,
+            'nativeCode',
+            isNull,
+          ),
+        ),
+      );
+      expect(native.order, isNot(contains('compute_embedding')));
+      expect(allocator.live, 0);
+    });
+
+    test('audio never reaches the engine (core refuses it first; reaching '
+        'the pass is a host bug)', () async {
+      await expectLater(
+        p.embed(
+          EmbeddingInput.audio(Uint8List.fromList([1, 2, 3])),
+          TaskType.none,
+        ),
+        throwsA(isA<EmbeddingEngineException>()),
+      );
+      expect(native.order, isNot(contains('input_data_create')));
+      expect(allocator.live, 0);
+    });
+  });
+
+  group('embed audio and combined inputs (the 740m)', () {
+    late LiteRtLmEmbeddingPass p;
+
+    setUp(() async {
+      File(_header740m).copySync(modelPath);
+      native.visionSignatures = const [70, 140];
+      p = pass(
+        declaredMedia: {EmbeddingModality.image, EmbeddingModality.audio},
+      );
+      await p.load();
+    });
+
+    tearDown(() => p.close());
+
+    test('sends the encoded clip as ONE audio part, never a prefix, for '
+        'every TaskType', () async {
+      for (final taskType in TaskType.values) {
+        final vector = await p.embed(EmbeddingInput.audio(_wav), taskType);
+        expect(vector, native.lastVector);
+        expect(native.lastPartTypes, [
+          LiteRtLmInputDataType.kLiteRtLmInputDataTypeAudio,
+        ]);
+        expect(native.lastParts.single, _wav);
+      }
+      expect(native.live.keys, unorderedEquals(['engine', 'options']));
+      expect(allocator.live, 0);
+    });
+
+    test('a combined input is ONE request: the prefixed text, the images in '
+        'order, then the audio', () async {
+      final second = Uint8List.fromList([..._png, 1]);
+      for (final taskType in TaskType.values) {
+        await p.embed(
+          EmbeddingInput(text: 'a cat', images: [_png, second], audio: _wav),
+          taskType,
+        );
+        expect(native.lastPartTypes, [
+          LiteRtLmInputDataType.kLiteRtLmInputDataTypeText,
+          LiteRtLmInputDataType.kLiteRtLmInputDataTypeImage,
+          LiteRtLmInputDataType.kLiteRtLmInputDataTypeImage,
+          LiteRtLmInputDataType.kLiteRtLmInputDataTypeAudio,
+        ]);
+        expect(native.lastTexts, ['${taskType.prefix}a cat']);
+        expect(native.lastParts.sublist(1), [_png, second, _wav]);
+      }
+      expect(native.created('input_data'), native.deleted('input_data'));
+      expect(native.live.keys, unorderedEquals(['engine', 'options']));
+      expect(allocator.live, 0);
+    });
+
+    test('an overflow with media reports the exact counts, media tokens '
+        'included', () async {
+      native
+        ..responseInputLength = 1504
+        ..responseTruncatedLength = 1024;
+      await expectLater(
+        p.embed(EmbeddingInput.audio(_wav), TaskType.none),
+        throwsA(
+          isA<EmbeddingInputTooLongException>()
+              .having((e) => e.maxInputTokens, 'maxInputTokens', 1024)
+              .having((e) => e.actualTokens, 'actualTokens', 1504),
+        ),
+      );
+      expect(native.live.keys, unorderedEquals(['engine', 'options']));
+      expect(allocator.live, 0);
+    });
+
+    test('status 2 on audio is miniaudio refusing the file: '
+        'EmbeddingEngineException(nativeCode 2) naming the audio; the engine '
+        'keeps working', () async {
+      native.failCompute = (
+        code: 2,
+        message: 'Failed to initialize miniaudio decoder, error code: -10',
+      );
+      await expectLater(
+        p.embed(EmbeddingInput.audio(_wav), TaskType.none),
+        throwsA(
+          isA<EmbeddingEngineException>()
+              .having((e) => e.nativeCode, 'nativeCode', 2)
+              .having(
+                (e) => e.message,
+                'message',
+                allOf(
+                  contains('could not decode the audio'),
+                  contains('miniaudio'),
+                ),
+              ),
+        ),
+      );
+      expect(native.live.keys, unorderedEquals(['engine', 'options']));
+      expect(allocator.live, 0);
+      native.failCompute = null;
+      expect(
+        await p.embed(EmbeddingInput.audio(_wav), TaskType.none),
+        native.lastVector,
+      );
+    });
+
+    test('status 3 on a combined input with an image is the image decode '
+        'failure', () async {
+      native.failCompute = (code: 3, message: 'Failed to decode image');
+      await expectLater(
+        p.embed(
+          EmbeddingInput(text: 'x', images: [_png], audio: _wav),
+          TaskType.none,
+        ),
+        throwsA(
+          isA<EmbeddingEngineException>()
+              .having((e) => e.nativeCode, 'nativeCode', 3)
+              .having(
+                (e) => e.message,
+                'message',
+                contains('could not decode an image'),
+              ),
+        ),
+      );
+      expect(native.created('input_data'), 3);
+      expect(native.live.keys, unorderedEquals(['engine', 'options']));
+      expect(allocator.live, 0);
+    });
+
+    test('input_data_create returning NULL for a later part: the parts made '
+        'before it are deleted, nothing is computed', () async {
+      native.failInputDataAt = 2; // text and image made, the audio fails
+      await expectLater(
+        p.embed(
+          EmbeddingInput(text: 'x', images: [_png], audio: _wav),
+          TaskType.none,
+        ),
+        throwsA(
+          isA<EmbeddingEngineException>().having(
+            (e) => e.message,
+            'message',
+            contains('audio part'),
+          ),
+        ),
+      );
+      expect(native.created('input_data'), 2);
+      expect(native.deleted('input_data'), 2);
+      expect(native.order, isNot(contains('compute_embedding')));
+      expect(native.live.keys, unorderedEquals(['engine', 'options']));
+      expect(allocator.live, 0);
+    });
+  });
+
+  group('a pass loaded without audio', () {
+    test('audio never reaches the engine, alone or combined (core refuses '
+        'it first; reaching the pass is a host bug)', () async {
+      native.visionSignatures = const [70, 140];
+      final p = pass(declaredMedia: {EmbeddingModality.image});
+      await p.load();
+      for (final input in [
+        EmbeddingInput.audio(_wav),
+        EmbeddingInput(text: 'x', audio: _wav),
+      ]) {
+        await expectLater(
+          p.embed(input, TaskType.none),
+          throwsA(isA<EmbeddingEngineException>()),
+        );
+      }
+      expect(native.order, isNot(contains('input_data_create')));
+      expect(allocator.live, 0);
+      await p.close();
+    });
+  });
+
+  group('embeddingParts', () {
+    test('a combined input: text with its prefix, then the images in order, '
+        'then the audio — whatever order the arguments were given in', () {
+      final first = Uint8List.fromList([1]);
+      final second = Uint8List.fromList([2]);
+      final clip = Uint8List.fromList([3]);
+      final parts = embeddingParts(
+        EmbeddingInput(audio: clip, images: [first, second], text: 'hi'),
+        TaskType.retrievalQuery,
+      );
+      expect(
+        [for (final part in parts) part.kind],
+        [
+          EmbeddingPartKind.text,
+          EmbeddingPartKind.image,
+          EmbeddingPartKind.image,
+          EmbeddingPartKind.audio,
+        ],
+      );
+      expect(
+        utf8.decode(parts[0].bytes),
+        '${TaskType.retrievalQuery.prefix}hi',
+      );
+      expect(
+        [for (final part in parts.skip(1)) part.bytes],
+        [first, second, clip],
+      );
+    });
+
+    test('a text input is one text part: the task prefix, then the text', () {
+      for (final taskType in TaskType.values) {
+        final parts = embeddingParts(EmbeddingInput.text('héllo'), taskType);
+        expect(parts, hasLength(1));
+        expect(parts.single.kind, EmbeddingPartKind.text);
+        expect(utf8.decode(parts.single.bytes), '${taskType.prefix}héllo');
+      }
+    });
+
+    test('an image input is one image part with its bytes: no prefix', () {
+      for (final taskType in TaskType.values) {
+        final parts = embeddingParts(EmbeddingInput.image(_png), taskType);
+        expect(parts, hasLength(1));
+        expect(parts.single.kind, EmbeddingPartKind.image);
+        expect(parts.single.bytes, _png);
+      }
+    });
+
+    test('an audio input is one audio part with its bytes: no prefix', () {
+      final clip = Uint8List.fromList([82, 73, 70, 70]);
+      final parts = embeddingParts(
+        EmbeddingInput.audio(clip),
+        TaskType.retrievalQuery,
+      );
+      expect(parts.single.kind, EmbeddingPartKind.audio);
+      expect(parts.single.bytes, clip);
+    });
+  });
+
+  group('close', () {
+    test('deletes the engine and options once; idempotent', () async {
+      final p = pass();
+      await p.load();
+      await p.close();
+      await p.close();
+      expect(native.deleted('engine'), 1);
+      expect(native.deleted('options'), 1);
+      expectNothingLeaked();
+    });
+
+    test('is safe before load', () async {
+      await pass().close();
+      expect(native.order, isEmpty);
+    });
+  });
+
+  group('the symbol gate (R5 §4.11)', () {
+    test('a library without an EmbeddingEngine symbol is refused by name', () {
+      expect(
+        () => checkLiteRtLmEmbeddingSymbols(
+          (symbol) => symbol != 'litert_lm_embedding_engine_create',
+          library: 'libLiteRtLm.so',
+        ),
+        throwsA(
+          isA<EmbeddingLoadException>()
+              .having((e) => e.engine, 'engine', 'LiteRT-LM')
+              .having(
+                (e) => e.message,
+                'message',
+                allOf(
+                  contains('libLiteRtLm.so'),
+                  contains('litert_lm_embedding_engine_create'),
+                  contains('native-v0.19.0-a'),
+                ),
+              ),
+        ),
+      );
+    });
+
+    test('a complete library passes', () {
+      checkLiteRtLmEmbeddingSymbols((_) => true, library: 'libLiteRtLm.so');
+    });
+
+    test('covers every native function the pass calls', () async {
+      native.visionSignatures = const [70, 140];
+      final p = pass(declaredMedia: {EmbeddingModality.image});
+      await p.load();
+      await p.embed(EmbeddingInput.text('x'), TaskType.retrievalQuery);
+      await p.embed(EmbeddingInput.image(_png), TaskType.none);
+      native.failCompute = (code: 3, message: 'bad image');
+      await expectLater(
+        p.embed(EmbeddingInput.image(_png), TaskType.none),
+        throwsA(isA<EmbeddingEngineException>()),
+      );
+      await p.close();
+      expect(
+        native.symbolsCalled,
+        containsAll([
+          'litert_lm_embedding_response_get_input_length',
+          'litert_lm_embedding_response_get_truncated_length',
+        ]),
+      );
+      expect(
+        native.symbolsCalled,
+        contains(
+          'litert_lm_embedding_engine_settings_set_vision_tokens_per_image',
+        ),
+      );
+      expect(
+        liteRtLmEmbeddingSymbols,
+        containsAll(native.symbolsCalled),
+        reason: 'the gate must check every symbol the pass looks up',
+      );
+    });
+  });
+
+  group('a generic bundle on the GPU', () {
+    test('settings on "gpu", towers NULL, no dispatch directory, a probe '
+        'embedding before load returns, and activeBackend gpu', () async {
+      final p = pass(gpu: true);
+      final info = await p.load();
+      expect(native.settingsBackend, 'gpu');
+      expect(native.towerBackendsNull, isTrue);
+      expect(native.dispatchDirs, isEmpty);
+      // engine_create compiles but never runs the graph: the load embeds
+      // once itself.
+      final probe = native.order.indexOf('compute_embedding');
+      expect(probe, greaterThan(native.order.indexOf('options_create')));
+      expect(native.lastTexts, ['task: search result | query: probe']);
+      expect(native.created('response'), 1);
+      expect(native.deleted('response'), 1);
+      expect(
+        info.activeBackend,
+        PreferredBackend.gpu,
+        reason:
+            'core requires activeBackend once this backend honours gpu on '
+            'the host; without it every GPU load is refused',
+      );
+      expect(info.dimension, 4);
+      expect(info.modalities, {EmbeddingModality.text});
+
+      final vector = await p.embed(
+        EmbeddingInput.text('hello'),
+        TaskType.retrievalQuery,
+      );
+      expect(vector, hasLength(4));
+      await p.close();
+      expectNothingLeaked();
+    });
+
+    test('a CPU load reports activeBackend cpu', () async {
+      final info = await pass().load();
+      expect(info.activeBackend, PreferredBackend.cpu);
+    });
+
+    test('ML Drift\'s two caches written: the GPU load says nothing about '
+        'them, with or without requireWeightCache', () async {
+      for (final strict in [false, true]) {
+        final p = pass(gpu: true, requireWeightCache: strict);
+        final lines = await _printsDuring(() async {
+          expect((await p.load()).activeBackend, PreferredBackend.gpu);
+        });
+        expect(_aboutGpuCache(lines), isEmpty, reason: 'strict: $strict');
+        await p.close();
+      }
+      expectNothingLeaked();
+    });
+
+    test('requireWeightCache: no GPU cache after the probe is a load failure '
+        'naming the directory, the path length and the causes; the engine is '
+        'deleted', () async {
+      native.writeCacheOnCreate = false;
+      final dir = expectedCacheDir();
+      final p = pass(gpu: true, requireWeightCache: true);
+      final lines = await _printsDuring(
+        () => expectLater(
+          p.load(),
+          throwsA(
+            isA<EmbeddingLoadException>().having(
+              (e) => e.message,
+              'message',
+              allOf([
+                contains('wrote no GPU cache'),
+                contains('to $dir while loading $_file'),
+                contains('requireWeightCache: true'),
+                contains(
+                  'about ${_gpuProgramCachePath(dir).length} characters',
+                ),
+                contains('MAX_PATH'),
+                contains('a directory this process cannot write to'),
+              ]),
+            ),
+          ),
+        ),
+      );
+      expect(_aboutGpuCache(lines), isEmpty, reason: 'refused, not warned');
+      expect(native.order.indexOf('compute_embedding'), greaterThan(-1));
+      expect(native.deleted('engine'), 1);
+      expect(native.deleted('options'), 1);
+      await p.close();
+      expectNothingLeaked();
+    });
+
+    test('without the flag no GPU cache is a printed warning and the load goes '
+        'on', () async {
+      native.writeCacheOnCreate = false;
+      final p = pass(gpu: true);
+      final lines = await _printsDuring(() async {
+        expect((await p.load()).activeBackend, PreferredBackend.gpu);
+      });
+      expect(_aboutGpuCache(lines), [
+        allOf(
+          contains('WARNING'),
+          contains('wrote no GPU cache'),
+          contains(expectedCacheDir()),
+          contains('requireWeightCache: true'),
+        ),
+      ]);
+      await p.close();
+      expectNothingLeaked();
+    });
+
+    test(
+      'one of the two GPU caches missing is a warning, never a refusal',
+      () async {
+        for (final kind in ['weight', 'program']) {
+          native.dispose();
+          native = _FakeLiteRtLm()..omitGpuCaches = {kind};
+          final dir = Directory(expectedCacheDir());
+          if (dir.existsSync()) dir.deleteSync(recursive: true);
+          final p = pass(gpu: true, requireWeightCache: true);
+          final lines = await _printsDuring(() async {
+            expect((await p.load()).activeBackend, PreferredBackend.gpu);
+          });
+          expect(_aboutGpuCache(lines), [
+            allOf(contains('WARNING'), contains('no GPU $kind cache')),
+          ], reason: kind);
+          await p.close();
+        }
+      },
+    );
+
+    test('the GPU caches are looked for after the probe embedding: a program '
+        'cache the first run writes counts', () async {
+      native.gpuProgramCacheOnCompute = true;
+      final p = pass(gpu: true, requireWeightCache: true);
+      final lines = await _printsDuring(() async {
+        expect((await p.load()).activeBackend, PreferredBackend.gpu);
+      });
+      expect(_aboutGpuCache(lines), isEmpty);
+      await p.close();
+      expectNothingLeaked();
+    });
+
+    test('the cache directory is logged after create and after the probe, '
+        'with each file\'s size', () async {
+      native.gpuProgramCacheOnCompute = true;
+      final logged = <String>[];
+      final original = debugPrint;
+      debugPrint = (message, {wrapWidth}) => logged.add(message ?? '');
+      addTearDown(() => debugPrint = original);
+      await pass(gpu: true).load();
+      final listings = logged
+          .where((l) => l.contains(expectedCacheDir()))
+          .where((l) => l.contains(' after '))
+          .toList();
+      expect(listings, [
+        allOf(
+          contains('after engine create'),
+          contains('_mldrift_weight_cache.bin ${1 << 20} B'),
+          isNot(contains('program')),
+        ),
+        allOf(
+          contains('after the probe embedding'),
+          contains('_mldrift_program_cache.bin ${1 << 20} B'),
+        ),
+      ]);
+    });
+
+    group('a GPU cache file name past 255 characters', () {
+      // 210 + `.text_encoder_<10>_<size>_mldrift_program_cache.bin` > 255, on
+      // every file system; the model file itself still fits.
+      final long = '${'m' * 201}.litertlm';
+
+      setUp(() {
+        modelPath = '${root.path}/models/$long';
+        File(modelPath).writeAsBytesSync(List.filled(37, 7));
+      });
+
+      test('requireWeightCache: refused before the engine is created, naming '
+          'the length, the limit, the file and the cache root', () async {
+        final p = pass(gpu: true, requireWeightCache: true);
+        await expectLater(
+          p.load(),
+          throwsA(
+            isA<EmbeddingLoadException>().having(
+              (e) => e.message,
+              'message',
+              allOf([
+                contains('cannot write the GPU caches of $long'),
+                contains('under the cache root $cacheBase'),
+                contains(
+                  'program cache file name would be about '
+                  '${liteRtLmGpuCacheFileNames(long, 37).program.length} '
+                  '${_nameUnit}s',
+                ),
+                contains('255-$_nameUnit limit'),
+                contains('requireWeightCache: true'),
+              ]),
+            ),
+          ),
+        );
+        expect(native.created('engine'), 0);
+        await p.close();
+        expectNothingLeaked();
+      });
+
+      test('without the flag: a warning, and the load goes on', () async {
+        final p = pass(gpu: true);
+        final lines = await _printsDuring(() async {
+          expect((await p.load()).activeBackend, PreferredBackend.gpu);
+        });
+        expect(lines.where((l) => l.contains('cannot write the GPU caches')), [
+          allOf(contains('WARNING'), contains('255-$_nameUnit limit')),
+        ]);
+        await p.close();
+        expectNothingLeaked();
+      });
+
+      test(
+        'without the flag, a path warned about before create is not '
+        'warned about again when the caches are missing after the probe',
+        () async {
+          // What ML Drift does with such a name: it writes nothing.
+          native.writeCacheOnCreate = false;
+          final p = pass(gpu: true);
+          final lines = await _printsDuring(() async {
+            expect((await p.load()).activeBackend, PreferredBackend.gpu);
+          });
+          expect(_aboutGpuCache(lines), [
+            allOf(
+              contains('WARNING'),
+              contains('cannot write the GPU caches'),
+              contains('255-$_nameUnit limit'),
+            ),
+          ]);
+          await p.close();
+          expectNothingLeaked();
+        },
+      );
+
+      test('on CPU the GPU caches are not looked at', () async {
+        final lines = await _printsDuring(() async {
+          await pass(requireWeightCache: true).load();
+        });
+        expect(lines.where((l) => l.contains('GPU cache')), isEmpty);
+      });
+    });
+
+    group('a GPU program cache name past 255, its weight cache name not', () {
+      // Program 256, weight 255.
+      final edge = '${'m' * 194}.litertlm';
+
+      setUp(() {
+        modelPath = '${root.path}/models/$edge';
+        File(modelPath).writeAsBytesSync(List.filled(37, 7));
+      });
+
+      test('the warning before create names the program cache alone and its '
+          'cost alone', () async {
+        native.dispose();
+        native = _FakeLiteRtLm()..omitGpuCaches = {'program'};
+        final p = pass(gpu: true);
+        final lines = await _printsDuring(() async {
+          expect((await p.load()).activeBackend, PreferredBackend.gpu);
+        });
+        expect(_aboutGpuCache(lines), [
+          allOf(
+            contains('cannot write the GPU program cache of $edge'),
+            contains('compiles the programs again'),
+            isNot(contains('uploads the weights')),
+          ),
+        ]);
+        await p.close();
+        expectNothingLeaked();
+      });
+
+      test('a weight cache missing for another reason is still warned about '
+          'after the probe', () async {
+        native.dispose();
+        native = _FakeLiteRtLm()..omitGpuCaches = {'program', 'weight'};
+        final p = pass(gpu: true);
+        final lines = await _printsDuring(() async {
+          expect((await p.load()).activeBackend, PreferredBackend.gpu);
+        });
+        expect(_aboutGpuCache(lines), [
+          contains('cannot write the GPU program cache'),
+          allOf(contains('WARNING'), contains('no GPU weight cache')),
+        ]);
+        await p.close();
+        expectNothingLeaked();
+      });
+    });
+
+    test(
+      'the load log names the towers on cpu beside the GPU text tower',
+      () async {
+        File(_header740m).copySync(modelPath);
+        native.visionSignatures = const [70, 140];
+        final logged = <String>[];
+        final original = debugPrint;
+        debugPrint = (message, {wrapWidth}) => logged.add(message ?? '');
+        addTearDown(() => debugPrint = original);
+        final p = pass(
+          gpu: true,
+          visionTowerOnCpu: true,
+          audioTowerOnCpu: true,
+        );
+        await p.load();
+        expect(logged.where((l) => l.contains('loaded $_file')), [
+          contains('backend=gpu (vision and audio on cpu),'),
+        ]);
+        await p.close();
+      },
+    );
+
+    test('the GPU cache names and the path check: the example app fits '
+        'Windows MAX_PATH with 15 characters to spare', () {
+      const model = 'embeddinggemma-2-text-270m__rev-9be6e8b90982.litertlm';
+      const base =
+          r'C:\Users\a-twenty-char-user-x\AppData\Local\dev.flutterberlin'
+          r'\flutter_edge_ai_example\flutter_edge_ai\emb';
+      final dir =
+          '$base\\${liteRtLmCacheDirName(model, size: 164626432, modified: DateTime.fromMillisecondsSinceEpoch(1791758581397))}';
+      final names = liteRtLmGpuCacheFileNames(model, 164626432);
+      expect(
+        names.weight,
+        '$model.text_encoder_0000000000_164626432_mldrift_weight_cache.bin',
+      );
+      expect(
+        names.program,
+        '$model.text_encoder_0000000000_164626432_mldrift_program_cache.bin',
+      );
+      expect(dir.length + 1 + names.program.length, 244);
+      expect(
+        liteRtLmGpuCachePathProblem(dir, model, 164626432, windows: true),
+        isNull,
+      );
+      // 15 more characters: the program path is 259, still under.
+      final longer = '$dir${'x' * 15}';
+      expect(
+        liteRtLmGpuCachePathProblem(longer, model, 164626432, windows: true),
+        isNull,
+      );
+      // 16 more: 260, past MAX_PATH for the program cache only.
+      final past = liteRtLmGpuCachePathProblem(
+        '$longer'
+        'x',
+        model,
+        164626432,
+        windows: true,
+      );
+      expect(
+        past,
+        allOf(
+          contains('program cache file path would be about 260 characters'),
+          contains("Windows' 260-character MAX_PATH"),
+          isNot(contains('weight')),
+        ),
+      );
+      // Linux has no 260 limit on a path.
+      expect(
+        liteRtLmGpuCachePathProblem(
+          '$longer'
+          'x',
+          model,
+          164626432,
+          windows: false,
+        ),
+        isNull,
+      );
+    });
+
+    test('a non-ASCII model file name: the 255 limit counts UTF-8 bytes off '
+        'Windows and UTF-16 code units on it', () {
+      // 109 UTF-16 code units, 209 UTF-8 bytes: the cache names are about
+      // 160 code units and 260 bytes long.
+      final model = '${'м' * 100}.litertlm';
+      final names = liteRtLmGpuCacheFileNames(model, 37);
+      expect(names.program.length, lessThan(255));
+      expect(utf8.encode(names.program).length, greaterThan(255));
+      expect(
+        liteRtLmGpuCachePathProblem('/c', model, 37, windows: false),
+        allOf(
+          contains(
+            'program cache file name would be about '
+            '${utf8.encode(names.program).length} bytes long',
+          ),
+          contains('255-byte limit'),
+        ),
+      );
+      expect(
+        liteRtLmGpuCachePathProblem(
+          r'C:\c',
+          model,
+          37,
+          windows: true,
+          ansiCodePageIsUtf8: true,
+        ),
+        isNull,
+      );
+      // 80 Cyrillic characters fit in bytes too.
+      expect(
+        liteRtLmGpuCachePathProblem(
+          '/c',
+          '${'м' * 80}.litertlm',
+          37,
+          windows: false,
+        ),
+        isNull,
+      );
+    });
+
+    test('on Windows a cache directory with a character outside ASCII is a '
+        'problem at any length, unless the ANSI code page is UTF-8; a model '
+        'file name outside ASCII is not', () {
+      const model = 'embeddinggemma-2-text-270m.litertlm';
+      const ascii = r'C:\Users\sasha\AppData\Local\app\emb\d';
+      const cyrillic = r'C:\Users\Саша\AppData\Local\app\emb\d';
+      expect(
+        liteRtLmGpuCachePathProblem(ascii, model, 37, windows: true),
+        isNull,
+      );
+      expect(
+        liteRtLmGpuCachePathProblem(cyrillic, model, 37, windows: true),
+        allOf(
+          contains('the cache directory has characters outside ASCII'),
+          contains('UCRT _open'),
+          contains('ANSI code page'),
+          contains('not measured'),
+          contains('create likely fails too, on every backend'),
+          isNot(contains('CreateFileA')),
+          isNot(contains('MAX_PATH')),
+        ),
+      );
+      expect(
+        liteRtLmGpuCachePathCheck(cyrillic, model, 37, windows: true),
+        isA<LiteRtLmGpuCachePathCheck>()
+            .having((c) => c.kinds, 'kinds', {'weight', 'program'})
+            .having((c) => c.cacheDirOutsideAnsi, 'outside', isTrue),
+      );
+      expect(
+        liteRtLmGpuCachePathProblem('${ascii}é', model, 37, windows: true),
+        contains('characters outside ASCII'),
+      );
+      // The cache directory's own name is ASCII by construction; a model file
+      // name outside ASCII still opens, under the name its UTF-8 bytes spell
+      // in the code page, so it is not refused.
+      expect(
+        liteRtLmGpuCachePathProblem(r'C:\c', 'é.litertlm', 37, windows: true),
+        isNull,
+      );
+      expect(
+        liteRtLmGpuCachePathProblem(
+          ascii,
+          '${'м' * 20}.litertlm',
+          37,
+          windows: true,
+        ),
+        isNull,
+      );
+      expect(
+        liteRtLmGpuCachePathProblem(
+          cyrillic,
+          model,
+          37,
+          windows: true,
+          ansiCodePageIsUtf8: true,
+        ),
+        isNull,
+      );
+      // Off Windows the accelerator opens the path as UTF-8.
+      expect(
+        liteRtLmGpuCachePathProblem(
+          '/home/Саша/.cache/emb/d',
+          model,
+          37,
+          windows: false,
+        ),
+        isNull,
+      );
+      expect(liteRtLmPathOutsideAscii('abc~\x7F'), isFalse);
+      expect(liteRtLmPathOutsideAscii('ab\u0080'), isTrue);
+    });
+
+    test(
+      'on Windows without a UTF-8 code page a model file name outside ASCII '
+      'is counted in UTF-8 bytes, one character each after the conversion',
+      () {
+        // 109 UTF-16 units, 209 UTF-8 bytes: about 160 and 260 for the program
+        // cache name.
+        final model = '${'м' * 100}.litertlm';
+        final names = liteRtLmGpuCacheFileNames(model, 37);
+        expect(
+          liteRtLmGpuCachePathProblem(r'C:\c', model, 37, windows: true),
+          allOf(
+            contains(
+              'program cache file name would be about '
+              '${utf8.encode(names.program).length} characters',
+            ),
+            contains('255-character limit'),
+            contains('MAX_PATH'),
+            isNot(contains('outside ASCII')),
+          ),
+        );
+        expect(
+          liteRtLmGpuCachePathProblem(
+            r'C:\c',
+            model,
+            37,
+            windows: true,
+            ansiCodePageIsUtf8: true,
+          ),
+          isNull,
+        );
+      },
+    );
+
+    test('the check names the cache kinds each reason applies to: at the edge '
+        'only the program cache, one character longer than the weight cache', () {
+      // Program name 256, weight name 255: past the limit for the program only.
+      final model = '${'m' * 194}.litertlm';
+      final names = liteRtLmGpuCacheFileNames(model, 37);
+      expect(names.program.length, 256);
+      expect(names.weight.length, 255);
+      final check = liteRtLmGpuCachePathCheck('/c', model, 37, windows: false);
+      expect(check?.kinds, {'program'});
+      expect(check?.problem, isNot(contains('weight')));
+    });
+
+    test('a real GPU cache is a *_mldrift_{weight,program}_cache.bin of at '
+        'least 1 MiB', () {
+      final dir = Directory('${root.path}/gpu_scan')..createSync();
+      File sized(String name, int bytes) {
+        final file = File('${dir.path}/$name');
+        file.openSync(mode: FileMode.write)
+          ..truncateSync(bytes)
+          ..closeSync();
+        return file;
+      }
+
+      expect(
+        liteRtLmWrittenGpuCaches([
+          sized('m.text_encoder_1_2_mldrift_weight_cache.bin', 1 << 20),
+          sized('m.text_encoder_1_2_mldrift_program_cache.bin', (1 << 20) - 1),
+          sized('m_1_2.text_encoder.xnnpack_cache', 2 << 20),
+        ]),
+        (weight: true, program: false),
+      );
+      expect(
+        liteRtLmWrittenGpuCaches([
+          sized('m.text_encoder_1_2_mldrift_program_cache.bin', 9 << 20),
+          File('${dir.path}/gone_mldrift_weight_cache.bin'),
+        ]),
+        (weight: false, program: true),
+      );
+    });
+
+    test('a probe the GPU cannot run fails the load, naming the GPU, and '
+        'frees the engine', () async {
+      native.failCompute = (code: 13, message: 'DEADLINE_EXCEEDED');
+      final p = pass(gpu: true);
+      await expectLater(
+        p.load(),
+        throwsA(
+          isA<EmbeddingLoadException>()
+              .having(
+                (e) => e.message,
+                'message',
+                allOf(
+                  contains('could not run $_file on the GPU'),
+                  contains('DEADLINE_EXCEEDED'),
+                  contains('preferredBackend: cpu'),
+                  isNot(contains('NPU')),
+                ),
+              )
+              .having((e) => e.nativeCode, 'nativeCode', 13),
+        ),
+      );
+      expect(native.deleted('engine'), 1);
+      expect(native.deleted('options'), 1);
+      await p.close();
+      expectNothingLeaked();
+    });
+
+    test('a probe that returns a NaN fails the load, naming the GPU', () async {
+      native.vectorOverride = [0.5, double.nan, 0.1, 0.2];
+      final p = pass(gpu: true);
+      await expectLater(
+        p.load(),
+        throwsA(
+          isA<EmbeddingLoadException>().having(
+            (e) => e.message,
+            'message',
+            allOf(contains('$_file on the GPU returned'), contains('not used')),
+          ),
+        ),
+      );
+      await p.close();
+      expectNothingLeaked();
+    });
+
+    test('a GPU engine create that fails names the GPU, not the cache '
+        'directory, whatever the code', () async {
+      native.failEngine = (code: 3, message: 'no WebGPU adapter');
+      final p = pass(gpu: true);
+      await expectLater(
+        p.load(),
+        throwsA(
+          isA<EmbeddingLoadException>().having(
+            (e) => e.message,
+            'message',
+            allOf(
+              contains('on the GPU: no WebGPU adapter'),
+              contains('preferredBackend: cpu'),
+              isNot(contains('cache directory')),
+            ),
+          ),
+        ),
+      );
+      expectNothingLeaked();
+    });
+
+    test('requireWeightCache: the no-GPU-cache refusal deletes the stale '
+        'caches of earlier copies first — one of them may be what left no '
+        'free space', () async {
+      final stale = Directory('$cacheBase/${liteRtLmCacheDirPrefix(_file)}-1-2')
+        ..createSync(recursive: true);
+      File('${stale.path}/old_mldrift_weight_cache.bin').writeAsStringSync('x');
+      native.writeCacheOnCreate = false;
+      final p = pass(gpu: true, requireWeightCache: true, clock: anHourLater);
+      await expectLater(
+        p.load(),
+        throwsA(
+          isA<EmbeddingLoadException>().having(
+            (e) => e.message,
+            'message',
+            contains('wrote no GPU cache'),
+          ),
+        ),
+      );
+      expect(stale.existsSync(), isFalse);
+      expect(Directory(expectedCacheDir()).existsSync(), isTrue);
+      await p.close();
+      expectNothingLeaked();
+    });
+
+    test('a cache directory gone after the probe: without the flag a warning '
+        'and the load goes on, with it a load failure', () async {
+      native
+        ..writeCacheOnCreate = false
+        ..deleteCacheDirOnCreate = true;
+      final lenient = pass(gpu: true);
+      final lines = await _printsDuring(() async {
+        expect((await lenient.load()).activeBackend, PreferredBackend.gpu);
+      });
+      expect(_aboutGpuCache(lines), [
+        allOf(
+          contains('WARNING'),
+          contains(
+            'could not check the GPU caches LiteRT-LM was to write to '
+            '${expectedCacheDir()}',
+          ),
+          contains('requireWeightCache: true'),
+        ),
+      ]);
+      await lenient.close();
+      expectNothingLeaked();
+
+      final strict = pass(gpu: true, requireWeightCache: true);
+      await expectLater(
+        strict.load(),
+        throwsA(
+          isA<EmbeddingLoadException>()
+              .having((e) => e.cause, 'cause', isA<FileSystemException>())
+              .having(
+                (e) => e.message,
+                'message',
+                contains('could not check the GPU caches'),
+              ),
+        ),
+      );
+      await strict.close();
+      expectNothingLeaked();
+    });
+
+    group('the 440m/740m vision and audio towers beside a GPU text tower run '
+        'on CPU and write XNNPack weight caches, which are checked', () {
+      setUp(() => native.visionSignatures = const [70, 140]);
+
+      Future<List<String>> load({
+        required String header,
+        Set<String> omit = const {},
+        bool requireWeightCache = false,
+      }) async {
+        native.dispose();
+        native = _FakeLiteRtLm()
+          ..visionSignatures = const [70, 140]
+          ..omitTowerCaches = omit;
+        File(header).copySync(modelPath);
+        final dir = Directory(expectedCacheDir());
+        if (dir.existsSync()) dir.deleteSync(recursive: true);
+        final p = pass(
+          gpu: true,
+          visionTowerOnCpu: true,
+          audioTowerOnCpu: header == _header740m,
+          requireWeightCache: requireWeightCache,
+        );
+        try {
+          final lines = await _printsDuring(() async {
+            expect((await p.load()).activeBackend, PreferredBackend.gpu);
+          });
+          return _aboutWeightCache(lines).toList();
+        } finally {
+          await p.close();
+          expectNothingLeaked();
+        }
+      }
+
+      test('all written: nothing said, with or without the flag', () async {
+        for (final header in [_header440m, _header740m]) {
+          expect(await load(header: header), isEmpty, reason: header);
+          expect(
+            await load(header: header, requireWeightCache: true),
+            isEmpty,
+            reason: header,
+          );
+        }
+      });
+
+      test(
+        'the 440m without its vision cache: a warning naming the vision '
+        'tower, and with the flag a load failure; the engine is deleted',
+        () async {
+          expect(await load(header: _header440m, omit: {'vision_encoder'}), [
+            allOf(
+              contains('WARNING'),
+              contains(
+                'wrote no weight cache to ${expectedCacheDir()} for the vision '
+                'tower, which runs on CPU,',
+              ),
+              contains('requireWeightCache: true'),
+              isNot(contains('290 MB')),
+            ),
+          ]);
+          await expectLater(
+            load(
+              header: _header440m,
+              omit: {'vision_encoder'},
+              requireWeightCache: true,
+            ),
+            throwsA(
+              isA<EmbeddingLoadException>().having(
+                (e) => e.message,
+                'message',
+                allOf(
+                  contains('for the vision tower, which runs on CPU,'),
+                  contains('requireWeightCache: true'),
+                  contains(
+                    'about ${liteRtLmCacheFilePathLength(expectedCacheDir(), _file, File(_header440m).lengthSync(), tower: '.vision_encoder')} '
+                    'characters',
+                  ),
+                ),
+              ),
+            ),
+          );
+          expect(native.deleted('engine'), 1);
+        },
+      );
+
+      test('the 740m: one tower missing beside the other is a warning, never a '
+          'refusal; both missing is a refusal under the flag', () async {
+        expect(
+          await load(
+            header: _header740m,
+            omit: {'static_audio_encoder'},
+            requireWeightCache: true,
+          ),
+          [
+            allOf(
+              contains('WARNING'),
+              contains('wrote no weight cache for the audio tower'),
+            ),
+          ],
+        );
+        await expectLater(
+          load(
+            header: _header740m,
+            omit: {'static_audio_encoder', 'vision_encoder'},
+            requireWeightCache: true,
+          ),
+          throwsA(
+            isA<EmbeddingLoadException>().having(
+              (e) => e.message,
+              'message',
+              contains(
+                'for the vision tower and the audio tower, which run on CPU,',
+              ),
+            ),
+          ),
+        );
+      });
+    });
+
+    test('the 740m: text on "gpu", its vision and audio towers named "cpu", '
+        'images and audio embedded', () async {
+      File(_header740m).copySync(modelPath);
+      native.visionSignatures = const [70, 140];
+      final p = pass(
+        gpu: true,
+        visionTowerOnCpu: true,
+        audioTowerOnCpu: true,
+        declaredMedia: {EmbeddingModality.image, EmbeddingModality.audio},
+      );
+      final info = await p.load();
+      expect(native.settingsBackend, 'gpu');
+      expect(native.settingsVisionBackend, 'cpu');
+      expect(native.settingsAudioBackend, 'cpu');
+      expect(info.activeBackend, PreferredBackend.gpu);
+      expect(info.modalities, {
+        EmbeddingModality.text,
+        EmbeddingModality.image,
+        EmbeddingModality.audio,
+      });
+      expect(
+        await p.embed(EmbeddingInput.image(_png), TaskType.retrievalDocument),
+        hasLength(4),
+      );
+      expect(
+        await p.embed(EmbeddingInput.audio(_wav), TaskType.retrievalDocument),
+        hasLength(4),
+      );
+      await p.close();
+      expectNothingLeaked();
+    });
+
+    test('the 440m: its vision tower named "cpu" even with no image '
+        'declared, and no audio tower named (it has none)', () async {
+      File(_header440m).copySync(modelPath);
+      native.visionSignatures = const [70, 140];
+      final p = pass(gpu: true, visionTowerOnCpu: true);
+      await p.load();
+      expect(native.settingsBackend, 'gpu');
+      expect(native.settingsVisionBackend, 'cpu');
+      expect(native.settingsAudioBackend, isNull);
+      await p.close();
+      expectNothingLeaked();
+    });
+  });
+
+  group('a per-SoC bundle on the NPU', () {
+    setUp(() => native.textSignatures = _npuSignatures);
+
+    test(
+      'declared audio on the 740m: the audio encoder is named "cpu" (its '
+      'per-SoC builds compile it for cpu/gpu only), vision stays NULL',
+      () async {
+        File(_header740m).copySync(modelPath);
+        native.visionSignatures = const [70, 140];
+        await pass(
+          npuTarget: _sm8850,
+          declaredMedia: {EmbeddingModality.image, EmbeddingModality.audio},
+        ).load();
+        expect(native.settingsBackend, 'npu');
+        expect(native.settingsAudioBackend, 'cpu');
+        expect(native.settingsVisionBackend, isNull);
+      },
+    );
+
+    test('no audio declared on the 740m: the audio tower is still named '
+        '"cpu" (describe() sets audioTowerOnCpu from the container: with its '
+        'backend NULL the create fails), vision stays NULL', () async {
+      File(_header740m).copySync(modelPath);
+      native.visionSignatures = const [70, 140];
+      await pass(
+        npuTarget: _sm8850,
+        declaredMedia: {EmbeddingModality.image},
+        audioTowerOnCpu: true,
+      ).load();
+      expect(native.settingsBackend, 'npu');
+      expect(native.settingsAudioBackend, 'cpu');
+      expect(native.settingsVisionBackend, isNull);
+    });
+
+    test(
+      'a per-SoC bundle without an audio tower: both towers stay NULL',
+      () async {
+        File(_header440m).copySync(modelPath);
+        native.visionSignatures = const [70, 140];
+        await pass(
+          npuTarget: _sm8850,
+          declaredMedia: {EmbeddingModality.image},
+        ).load();
+        expect(native.towerBackendsNull, isTrue);
+      },
+    );
+
+    test('without declared audio the cache is not checked: the text and '
+        'vision towers on the NPU write none, so an empty directory is '
+        'neither refused nor reported', () async {
+      native
+        ..writeCacheOnCreate = false
+        ..visionSignatures = const [70, 140];
+      final p = pass(
+        npuTarget: _sm8850,
+        declaredMedia: {EmbeddingModality.image},
+        requireWeightCache: true,
+      );
+      final lines = await _printsDuring(() async {
+        final info = await p.load();
+        expect(info.dimension, 4);
+      });
+      expect(_aboutWeightCache(lines), isEmpty);
+      expect(native.live['engine'], hasLength(1));
+      await p.close();
+      expectNothingLeaked();
+    });
+
+    test('declared audio on the 740m: its tower runs on CPU and writes a '
+        'cache, which is checked — refused under requireWeightCache when '
+        'missing, accepted alone when written', () async {
+      File(_header740m).copySync(modelPath);
+      native.visionSignatures = const [70, 140];
+      final media = {EmbeddingModality.image, EmbeddingModality.audio};
+
+      final written = pass(
+        npuTarget: _sm8850,
+        declaredMedia: media,
+        requireWeightCache: true,
+      );
+      final lines = await _printsDuring(() async {
+        expect((await written.load()).dimension, 4);
+      });
+      expect(
+        _aboutWeightCache(lines),
+        isEmpty,
+        reason:
+            'the audio cache is the one expected; text and vision run on '
+            'the NPU and write none',
+      );
+      expect(Directory(expectedCacheDir()).listSync().map((e) => e.path), [
+        endsWith('.static_audio_encoder.xnnpack_cache'),
+      ]);
+      await written.close();
+      expectNothingLeaked();
+
+      native.dispose();
+      native = _FakeLiteRtLm()
+        ..textSignatures = _npuSignatures
+        ..visionSignatures = const [70, 140]
+        ..writeCacheOnCreate = false;
+      Directory(expectedCacheDir()).deleteSync(recursive: true);
+      final strict = pass(
+        npuTarget: _sm8850,
+        declaredMedia: media,
+        requireWeightCache: true,
+      );
+      await expectLater(
+        strict.load(),
+        throwsA(
+          isA<EmbeddingLoadException>().having(
+            (e) => e.message,
+            'message',
+            contains('wrote no weight cache to ${expectedCacheDir()}'),
+          ),
+        ),
+      );
+      expect(native.deleted('engine'), 1);
+      await strict.close();
+      expectNothingLeaked();
+
+      final lenient = pass(npuTarget: _sm8850, declaredMedia: media);
+      final warned = await _printsDuring(() async {
+        expect((await lenient.load()).dimension, 4);
+      });
+      expect(
+        _aboutWeightCache(warned),
+        contains(contains('WARNING: LiteRT-LM wrote no weight cache')),
+      );
+      await lenient.close();
+      expectNothingLeaked();
+    });
+
+    test('settings on "npu", towers NULL, the dispatch directory handed to '
+        'every executor, and a probe embedding before load returns', () async {
+      native.visionSignatures = const [70, 140];
+      final p = pass(
+        npuTarget: _sm8850,
+        declaredMedia: {EmbeddingModality.image},
+      );
+      final info = await p.load();
+      expect(native.settingsBackend, 'npu');
+      expect(native.towerBackendsNull, isTrue);
+      expect(native.dispatchDirs, {
+        'main': _dispatchDir,
+        'vision': _dispatchDir,
+        'audio': _dispatchDir,
+      });
+      // The dispatch directories are set before the engine exists.
+      expect(
+        native.order.indexOf('settings_set_litert_dispatch_lib_dir'),
+        lessThan(native.order.indexOf('engine_create')),
+      );
+      // engine_create does not run the graph: the load embeds once itself.
+      final probe = native.order.indexOf('compute_embedding');
+      expect(probe, greaterThan(native.order.indexOf('options_create')));
+      expect(native.lastTexts, ['task: search result | query: probe']);
+      expect(native.created('response'), 1);
+      expect(native.deleted('response'), 1);
+      expect(info.dimension, 4);
+      expect(info.maxInputTokens, 1024);
+      expect(info.modalities, {
+        EmbeddingModality.text,
+        EmbeddingModality.image,
+      });
+
+      final vector = await p.embed(
+        EmbeddingInput.text('hello'),
+        TaskType.retrievalQuery,
+      );
+      expect(vector, hasLength(4));
+      await p.close();
+      expectNothingLeaked();
+    });
+
+    test(
+      'the CPU path is unchanged: "cpu", no dispatch directory, no probe',
+      () async {
+        native.textSignatures = _allSignatures;
+        final p = pass();
+        await p.load();
+        expect(native.settingsBackend, 'cpu');
+        expect(native.dispatchDirs, isEmpty);
+        expect(native.order, isNot(contains('compute_embedding')));
+        await p.close();
+        expectNothingLeaked();
+      },
+    );
+
+    test('a probe the NPU cannot run fails the load, naming the SoC, and '
+        'frees the engine', () async {
+      // What macOS gives an SM8850 bundle: create succeeds, then the graph
+      // cannot be prepared.
+      native.failCompute = (
+        code: 2,
+        message: 'Failed to invoke the compiled model',
+      );
+      final p = pass(npuTarget: _sm8850);
+      await expectLater(
+        p.load(),
+        throwsA(
+          isA<EmbeddingLoadException>()
+              .having(
+                (e) => e.message,
+                'message',
+                allOf(
+                  contains('could not run $_file on the NPU'),
+                  contains('Failed to invoke the compiled model'),
+                  contains('compiled for Qualcomm SM8850'),
+                  contains('with a QNN runtime that has no Skel'),
+                ),
+              )
+              .having((e) => e.nativeCode, 'nativeCode', 2),
+        ),
+      );
+      expect(native.deleted('engine'), 1);
+      expect(native.deleted('options'), 1);
+      await p.close();
+      expectNothingLeaked();
+    });
+
+    for (final (name, vector) in [
+      ('a NaN', [0.5, double.nan, 0.1, 0.2]),
+      ('an all-zero vector', [0.0, 0.0, 0.0, 0.0]),
+      ('an infinity', [0.5, double.infinity, 0.1, 0.2]),
+    ]) {
+      test('a probe that returns $name fails the load', () async {
+        native.vectorOverride = vector;
+        final p = pass(npuTarget: _sm8850);
+        await expectLater(
+          p.load(),
+          throwsA(
+            isA<EmbeddingLoadException>().having(
+              (e) => e.message,
+              'message',
+              allOf(
+                contains('Qualcomm SM8850 NPU returned'),
+                contains('not used'),
+              ),
+            ),
+          ),
+        );
+        await p.close();
+        expectNothingLeaked();
+      });
+    }
+
+    test('a probe of the wrong size fails the load', () async {
+      native.responseSize = 3;
+      final p = pass(npuTarget: _sm8850);
+      await expectLater(
+        p.load(),
+        throwsA(
+          isA<EmbeddingLoadException>().having(
+            (e) => e.message,
+            'message',
+            contains('3 values for dimension 4'),
+          ),
+        ),
+      );
+      await p.close();
+      expectNothingLeaked();
+    });
+
+    test('an NPU engine create that fails names the NPU, not the cache '
+        'directory, whatever the code', () async {
+      native.failEngine = (code: 3, message: 'dispatch init failed');
+      final p = pass(npuTarget: _sm8850);
+      await expectLater(
+        p.load(),
+        throwsA(
+          isA<EmbeddingLoadException>().having(
+            (e) => e.message,
+            'message',
+            allOf(
+              contains('on the Qualcomm SM8850 NPU'),
+              contains('dispatch init failed'),
+              isNot(contains('cache directory')),
+            ),
+          ),
+        ),
+      );
+      expectNothingLeaked();
+    });
+
+    test('an Intel bundle loads the same way, with the directory beside the '
+        'executable as every executor\'s dispatch directory', () async {
+      native.visionSignatures = const [70, 140];
+      const exeDir = r'C:\Apps\demo';
+      final p = pass(
+        npuTarget: _ptl,
+        npuDispatchDir: exeDir,
+        declaredMedia: {EmbeddingModality.image},
+      );
+      await p.load();
+      expect(native.settingsBackend, 'npu');
+      expect(native.towerBackendsNull, isTrue);
+      expect(native.dispatchDirs, {
+        'main': exeDir,
+        'vision': exeDir,
+        'audio': exeDir,
+      });
+      expect(native.lastTexts, ['task: search result | query: probe']);
+      await p.close();
+      expectNothingLeaked();
+    });
+
+    test('a probe an Intel NPU cannot run names a PC without one, not a QNN '
+        'Skel', () async {
+      native.failCompute = (code: 2, message: 'dispatch failed');
+      final p = pass(npuTarget: _ptl, npuDispatchDir: r'C:\Apps\demo');
+      await expectLater(
+        p.load(),
+        throwsA(
+          isA<EmbeddingLoadException>().having(
+            (e) => e.message,
+            'message',
+            allOf(
+              contains(
+                'compiled for IntelOpenVINO PTL; on another SoC, or on '
+                'a PC without an Intel NPU or its driver, it fails this way',
+              ),
+              isNot(contains('QNN')),
+            ),
+          ),
+        ),
+      );
+      await p.close();
+      expectNothingLeaked();
+    });
+
+    test('the symbol gate covers what an NPU load calls', () async {
+      final p = pass(npuTarget: _sm8850);
+      await p.load();
+      await p.close();
+      expect(liteRtLmEmbeddingSymbols, containsAll(native.symbolsCalled));
+      for (final setter in [
+        'litert_lm_embedding_engine_settings_set_litert_dispatch_lib_dir',
+        'litert_lm_embedding_engine_settings_set_vision_litert_dispatch_lib_dir',
+        'litert_lm_embedding_engine_settings_set_audio_litert_dispatch_lib_dir',
+      ]) {
+        expect(native.symbolsCalled, contains(setter));
+      }
+    });
+  });
+
+  test('the release gate checks exactly the symbols the pass needs', () {
+    // native/litert_lm/check_embedding_exports.py refuses to publish a
+    // tarball whose libLiteRtLm lacks one; it must ask for the same list.
+    final script = File(
+      'native/litert_lm/check_embedding_exports.py',
+    ).readAsStringSync();
+    final list = RegExp(
+      r'REQUIRED = \[(.*?)\]',
+      dotAll: true,
+    ).firstMatch(script)!.group(1)!;
+    final required = [
+      for (final m in RegExp(r'"([a-z_]+)"').allMatches(list)) m.group(1)!,
+    ];
+    expect(required, liteRtLmEmbeddingSymbols);
+  });
+
+  test('the bindings do not bind what D23 rules out', () {
+    final source = File(
+      'lib/src/ffi/litert_lm_embedding_bindings.dart',
+    ).readAsStringSync();
+    for (final symbol in [
+      'litert_lm_loaded_file_supports_input_modality',
+      'litert_lm_loaded_file_max_vision_token_budget',
+      'litert_lm_loaded_file_modality_supported_backends',
+    ]) {
+      expect(source, isNot(contains("'$symbol'")), reason: symbol);
+    }
+  });
+}
+
+/// What [body] prints, through the zone (the pass's warning is a `print`).
+Future<List<String>> _printsDuring(Future<void> Function() body) async {
+  final lines = <String>[];
+  await runZoned(
+    body,
+    zoneSpecification: ZoneSpecification(
+      print: (_, _, _, line) => lines.add(line),
+    ),
+  );
+  return lines;
+}
+
+/// The path LiteRT-LM gives the text tower's cache of the 37-byte test model
+/// in [dir]: `<dir>/<file>_<mtime s, 10 digits>_<size>.text_encoder.xnnpack_cache`.
+String _textCachePath(String dir) =>
+    '$dir/${_file}_1791758581_37.text_encoder.xnnpack_cache';
+
+/// The path LiteRT's WebGPU accelerator gives the program cache of the
+/// 37-byte test model in [dir].
+String _gpuProgramCachePath(String dir) =>
+    '$dir/${liteRtLmGpuCacheFileNames(_file, 37).program}';
+
+/// How this platform's file system counts the 255 limit on a file name.
+final _nameUnit = Platform.isWindows ? 'character' : 'byte';
+
+/// The lines of [lines] about ML Drift's GPU caches.
+Iterable<String> _aboutGpuCache(List<String> lines) =>
+    lines.where((line) => line.contains('GPU') && line.contains('cache'));
+
+/// The lines of [lines] about the weight cache.
+Iterable<String> _aboutWeightCache(List<String> lines) =>
+    lines.where((line) => line.contains('weight cache'));
+
+// ── Fakes ───────────────────────────────────────────────────────────────────
+
+Pointer<T> _noLookup<T extends NativeType>(String symbol) =>
+    throw StateError('the pass called $symbol, which the fake does not model');
+
+typedef _Failure = ({int code, String message});
+
+/// `kLiteRtLmStatusInvalidArgument`.
+const _invalidArgument = 3;
+
+/// `kLiteRtLmStatusNotFound`: ModelInfo's answer to a value the file does not
+/// define (C API 1.0; -1 before it).
+const _notFound = 5;
+
+/// LiteRT-LM's EmbeddingEngine C API, in Dart. Counts every create and delete
+/// per kind of object, records what the pass handed it, and fails on demand.
+///
+/// The C error state is thread-local and survives until the next failure on
+/// the thread; this fake is stricter: any native call made after a failure,
+/// other than the two error getters, overwrites it — so a pass that reads the
+/// error late gets the wrong one.
+final class _FakeLiteRtLm extends LiteRtLmEmbeddingBindings {
+  _FakeLiteRtLm() : super.fromLookup(_noLookup);
+
+  LiteRtLmModelType modelType = LiteRtLmModelType.kLiteRtLmModelTypeEmbedding;
+  int dimension = 4;
+  List<int>? textSignatures = _allSignatures; // null = NOT_FOUND
+
+  /// A ModelInfo getter (`'model_type'`, `'embedding_dimension'`,
+  /// `'embedding_signature_selection'`) that fails with this status.
+  ({String getter, int code})? failModelInfo;
+
+  int? _modelInfoFailure(String getter) {
+    final failure = failModelInfo;
+    if (failure == null || failure.getter != getter) return null;
+    return _fail((code: failure.code, message: '$getter broke'));
+  }
+
+  List<int>? visionSignatures; // null = NOT_FOUND, as on the 270m
+
+  _Failure? failLoadedFile;
+  _Failure? failSettings;
+  _Failure? failEngine;
+  _Failure? failCompute;
+  bool failOptions = false;
+  bool failInputData = false;
+
+  /// Fail only the input_data_create call with this index (0-based).
+  int? failInputDataAt;
+  int _inputDataCalls = 0;
+
+  /// What every response reports (section 14 getters): the whole input.
+  int responseInputLength = 12;
+  int responseTruncatedLength = 0;
+  bool silentNullCompute = false;
+  bool silentNullEngine = false;
+  bool writeCacheOnCreate = true;
+
+  /// The size of each cache file engine_create writes: by default a real one
+  /// (the pass counts a `*.xnnpack_cache` of at least 1 MiB); about 100 is
+  /// the header XNNPack writes first, all a failed write leaves.
+  int cacheFileBytes = 1 << 20;
+
+  /// Towers whose cache engine_create does not write (`'vision_encoder'`,
+  /// `'static_audio_encoder'`, …): a path that crossed MAX_PATH for the longer
+  /// names only.
+  Set<String> omitTowerCaches = const {};
+
+  /// ML Drift's GPU caches (`'weight'`, `'program'`) engine_create on the GPU
+  /// does not write.
+  Set<String> omitGpuCaches = const {};
+
+  /// The GPU program cache is written by the first compute_embedding (the
+  /// probe), not by engine_create.
+  bool gpuProgramCacheOnCompute = false;
+
+  /// The cache directory is gone by the time engine_create returns.
+  bool deleteCacheDirOnCreate = false;
+  _Failure? errorFromSetter;
+  int? responseSize;
+
+  /// When set, every response holds these values instead of the counting
+  /// ones (a NaN, all zeros, …).
+  List<double>? vectorOverride;
+
+  /// The dispatch directory handed to each executor: main, vision, audio.
+  final dispatchDirs = <String, String>{};
+
+  final order = <String>[];
+  final symbolsCalled = <String>{};
+  final live = <String, Set<int>>{};
+  final _created = <String, int>{};
+  final _deleted = <String, int>{};
+
+  String? loadedPath;
+  String? settingsModelPath;
+  String? settingsBackend;
+  bool towerBackendsNull = false;
+  String? settingsVisionBackend;
+  String? settingsAudioBackend;
+  String? cacheDir;
+  int? maxInputLength;
+  int? numThreads;
+  bool? normalize;
+  bool? insertSpecialTokens;
+  LiteRtLmInputOverflowStrategy? overflowStrategy;
+  int? visionTokensPerImage;
+  final _inputs = <int, (LiteRtLmInputDataType, Uint8List)>{};
+  List<String> lastTexts = const [];
+  List<Uint8List> lastParts = const [];
+  List<LiteRtLmInputDataType> lastPartTypes = const [];
+  List<double> lastVector = const [];
+  final _vectors = <int, Pointer<Float>>{};
+
+  int _nextAddress = 0x10000;
+  int _errorCode = 0;
+  Pointer<Utf8> _errorMessage = nullptr;
+
+  int created(String kind) => _created[kind] ?? 0;
+
+  /// What a failure on this thread long before left behind.
+  void setStaleError(int code, String message) => _setError(code, message);
+  int deleted(String kind) => _deleted[kind] ?? 0;
+
+  void dispose() {
+    for (final values in _vectors.values) {
+      calloc.free(values);
+    }
+    _vectors.clear();
+    if (_errorMessage != nullptr) calloc.free(_errorMessage);
+    _errorMessage = nullptr;
+  }
+
+  void _call(String name, String symbol) {
+    order.add(name);
+    symbolsCalled.add(symbol);
+    if (_errorCode != 0) _setError(99, 'overwritten by $name');
+  }
+
+  void _setError(int code, String message) {
+    if (_errorMessage != nullptr) calloc.free(_errorMessage);
+    _errorCode = code;
+    _errorMessage = message.toNativeUtf8();
+  }
+
+  Pointer<T> _create<T extends NativeType>(String kind) {
+    final address = _nextAddress += 0x10;
+    (live[kind] ??= {}).add(address);
+    _created[kind] = created(kind) + 1;
+    return Pointer.fromAddress(address);
+  }
+
+  void _delete(String kind, Pointer<NativeType> handle) {
+    final set = live[kind];
+    if (set == null || !set.remove(handle.address)) {
+      throw StateError('$kind ${handle.address} deleted twice or never made');
+    }
+    if (set.isEmpty) live.remove(kind);
+    _deleted[kind] = deleted(kind) + 1;
+  }
+
+  /// C API 1.0: a failed call sets the last error and returns its status.
+  /// Its out-parameter is not written then, so this fake leaves [out] holding
+  /// garbage: the pass must take the status, not the pointer, for the answer.
+  int _fail(_Failure failure, [Pointer<Pointer<NativeType>>? out]) {
+    _setError(failure.code, failure.message);
+    if (out != null) out.value = Pointer.fromAddress(0xBAD0);
+    return failure.code;
+  }
+
+  /// The status every embedding-engine setting setter returns, and the
+  /// message it leaves.
+  _Failure? failSetter;
+
+  int _setter() {
+    final failure = failSetter;
+    return failure == null ? 0 : _fail(failure);
+  }
+
+  /// A create's success: [handle] written through [out], status OK.
+  int _made<T extends NativeType>(Pointer<Pointer<T>> out, Pointer<T> handle) {
+    out.value = handle;
+    return 0;
+  }
+
+  static String _string(Pointer<Char> p) => p.cast<Utf8>().toDartString();
+
+  // ── error reporter ──
+  @override
+  void litert_lm_clear_last_error() {
+    order.add('clear_last_error');
+    symbolsCalled.add('litert_lm_clear_last_error');
+    if (_errorMessage != nullptr) calloc.free(_errorMessage);
+    _errorMessage = nullptr;
+    _errorCode = 0;
+  }
+
+  @override
+  Pointer<Char> litert_lm_get_last_error_message() {
+    order.add('get_last_error_message');
+    symbolsCalled.add('litert_lm_get_last_error_message');
+    return _errorMessage.cast();
+  }
+
+  // ── ModelInfo ──
+  @override
+  int litert_lm_loaded_file_create(
+    Pointer<Char> litertlm_path,
+    Pointer<Pointer<LiteRtLmLoadedFile>> out_loaded_file,
+  ) {
+    _call('loaded_file_create', 'litert_lm_loaded_file_create');
+    loadedPath = _string(litertlm_path);
+    final failure = failLoadedFile;
+    return failure != null
+        ? _fail(failure, out_loaded_file)
+        : _made(out_loaded_file, _create('loaded_file'));
+  }
+
+  @override
+  void litert_lm_loaded_file_delete(Pointer<LiteRtLmLoadedFile> loaded_file) {
+    _call('loaded_file_delete', 'litert_lm_loaded_file_delete');
+    _delete('loaded_file', loaded_file);
+  }
+
+  @override
+  int litert_lm_loaded_file_model_type(
+    Pointer<LiteRtLmLoadedFile> loaded_file,
+    Pointer<UnsignedInt> out_model_type,
+  ) {
+    _call('loaded_file_model_type', 'litert_lm_loaded_file_model_type');
+    final failed = _modelInfoFailure('model_type');
+    if (failed != null) return failed;
+    out_model_type.value = modelType.value;
+    return 0;
+  }
+
+  @override
+  int litert_lm_loaded_file_embedding_dimension(
+    Pointer<LiteRtLmLoadedFile> loaded_file,
+    Pointer<Int32> out_dimension,
+  ) {
+    _call(
+      'loaded_file_embedding_dimension',
+      'litert_lm_loaded_file_embedding_dimension',
+    );
+    final failed = _modelInfoFailure('embedding_dimension');
+    if (failed != null) return failed;
+    if (dimension < 0) return _notFound;
+    out_dimension.value = dimension;
+    return 0;
+  }
+
+  int _list(
+    List<int>? values,
+    Pointer<Int32> lengths,
+    int maxSize,
+    Pointer<Size> outCount,
+  ) {
+    if (values == null) return _notFound;
+    if (lengths != nullptr) {
+      for (var i = 0; i < values.length && i < maxSize; i++) {
+        lengths[i] = values[i];
+      }
+    }
+    outCount.value = values.length;
+    return 0;
+  }
+
+  @override
+  int litert_lm_loaded_file_embedding_signature_selection(
+    Pointer<LiteRtLmLoadedFile> loaded_file,
+    Pointer<Int32> lengths,
+    int max_size,
+    Pointer<Size> out_count,
+  ) {
+    _call(
+      'loaded_file_embedding_signature_selection',
+      'litert_lm_loaded_file_embedding_signature_selection',
+    );
+    final failed = _modelInfoFailure('embedding_signature_selection');
+    if (failed != null) return failed;
+    return _list(textSignatures, lengths, max_size, out_count);
+  }
+
+  @override
+  int litert_lm_loaded_file_vision_signature_selection(
+    Pointer<LiteRtLmLoadedFile> loaded_file,
+    Pointer<Int32> lengths,
+    int max_size,
+    Pointer<Size> out_count,
+  ) {
+    _call(
+      'loaded_file_vision_signature_selection',
+      'litert_lm_loaded_file_vision_signature_selection',
+    );
+    return _list(visionSignatures, lengths, max_size, out_count);
+  }
+
+  // ── settings ──
+  @override
+  int litert_lm_embedding_engine_settings_create(
+    Pointer<Char> model_path,
+    Pointer<Char> backend_str,
+    Pointer<Char> vision_backend_str,
+    Pointer<Char> audio_backend_str,
+    Pointer<Pointer<LiteRtLmEmbeddingEngineSettings>> out_settings,
+  ) {
+    _call('settings_create', 'litert_lm_embedding_engine_settings_create');
+    settingsModelPath = _string(model_path);
+    settingsBackend = _string(backend_str);
+    towerBackendsNull =
+        vision_backend_str == nullptr && audio_backend_str == nullptr;
+    settingsVisionBackend = vision_backend_str == nullptr
+        ? null
+        : _string(vision_backend_str);
+    settingsAudioBackend = audio_backend_str == nullptr
+        ? null
+        : _string(audio_backend_str);
+    final failure = failSettings;
+    return failure != null
+        ? _fail(failure, out_settings)
+        : _made(out_settings, _create('settings'));
+  }
+
+  @override
+  void litert_lm_embedding_engine_settings_delete(
+    Pointer<LiteRtLmEmbeddingEngineSettings> settings,
+  ) {
+    _call('settings_delete', 'litert_lm_embedding_engine_settings_delete');
+    _delete('settings', settings);
+  }
+
+  @override
+  int litert_lm_embedding_engine_settings_set_cache_dir(
+    Pointer<LiteRtLmEmbeddingEngineSettings> settings,
+    Pointer<Char> cache_dir,
+  ) {
+    _call(
+      'settings_set_cache_dir',
+      'litert_lm_embedding_engine_settings_set_cache_dir',
+    );
+    cacheDir = _string(cache_dir);
+    return 0;
+  }
+
+  @override
+  int litert_lm_embedding_engine_settings_set_max_input_length(
+    Pointer<LiteRtLmEmbeddingEngineSettings> settings,
+    int max_input_length,
+  ) {
+    _call(
+      'settings_set_max_input_length',
+      'litert_lm_embedding_engine_settings_set_max_input_length',
+    );
+    maxInputLength = max_input_length;
+    final error = errorFromSetter;
+    if (error != null) _setError(error.code, error.message);
+    return _setter();
+  }
+
+  @override
+  int litert_lm_embedding_engine_settings_set_vision_tokens_per_image(
+    Pointer<LiteRtLmEmbeddingEngineSettings> settings,
+    int vision_tokens_per_image,
+  ) {
+    _call(
+      'settings_set_vision_tokens_per_image',
+      'litert_lm_embedding_engine_settings_set_vision_tokens_per_image',
+    );
+    visionTokensPerImage = vision_tokens_per_image;
+    return 0;
+  }
+
+  @override
+  int litert_lm_embedding_engine_settings_set_num_threads(
+    Pointer<LiteRtLmEmbeddingEngineSettings> settings,
+    int num_threads,
+  ) {
+    _call(
+      'settings_set_num_threads',
+      'litert_lm_embedding_engine_settings_set_num_threads',
+    );
+    numThreads = num_threads;
+    return 0;
+  }
+
+  @override
+  int litert_lm_embedding_engine_settings_set_litert_dispatch_lib_dir(
+    Pointer<LiteRtLmEmbeddingEngineSettings> settings,
+    Pointer<Char> lib_dir,
+  ) {
+    _call(
+      'settings_set_litert_dispatch_lib_dir',
+      'litert_lm_embedding_engine_settings_set_litert_dispatch_lib_dir',
+    );
+    dispatchDirs['main'] = _string(lib_dir);
+    return 0;
+  }
+
+  @override
+  int litert_lm_embedding_engine_settings_set_vision_litert_dispatch_lib_dir(
+    Pointer<LiteRtLmEmbeddingEngineSettings> settings,
+    Pointer<Char> lib_dir,
+  ) {
+    _call(
+      'settings_set_vision_litert_dispatch_lib_dir',
+      'litert_lm_embedding_engine_settings_set_vision_litert_dispatch_lib_dir',
+    );
+    dispatchDirs['vision'] = _string(lib_dir);
+    return 0;
+  }
+
+  @override
+  int litert_lm_embedding_engine_settings_set_audio_litert_dispatch_lib_dir(
+    Pointer<LiteRtLmEmbeddingEngineSettings> settings,
+    Pointer<Char> lib_dir,
+  ) {
+    _call(
+      'settings_set_audio_litert_dispatch_lib_dir',
+      'litert_lm_embedding_engine_settings_set_audio_litert_dispatch_lib_dir',
+    );
+    dispatchDirs['audio'] = _string(lib_dir);
+    return 0;
+  }
+
+  // ── engine ──
+  @override
+  int litert_lm_embedding_engine_create(
+    Pointer<LiteRtLmEmbeddingEngineSettings> settings,
+    Pointer<Pointer<LiteRtLmEmbeddingEngine>> out_engine,
+  ) {
+    _call('engine_create', 'litert_lm_embedding_engine_create');
+    final failure = failEngine;
+    if (failure != null) return _fail(failure, out_engine);
+    // OK with no engine: a failure that reports nothing.
+    if (silentNullEngine) return _made(out_engine, nullptr);
+    final dir = cacheDir;
+    if (writeCacheOnCreate && dir != null) {
+      for (final tower in _cachedTowers()) {
+        if (omitTowerCaches.contains(tower)) continue;
+        // Sparse: the size is what the pass reads, not the bytes.
+        File(
+            '$dir/eg2.litertlm_1791758581_37.$tower.xnnpack_cache',
+          ).openSync(mode: FileMode.write)
+          ..truncateSync(cacheFileBytes)
+          ..closeSync();
+      }
+      if (settingsBackend == 'gpu') {
+        for (final kind in [
+          'weight',
+          if (!gpuProgramCacheOnCompute) 'program',
+        ]) {
+          if (!omitGpuCaches.contains(kind)) _writeGpuCache(dir, kind);
+        }
+      }
+    }
+    if (deleteCacheDirOnCreate && dir != null) {
+      Directory(dir).deleteSync(recursive: true);
+    }
+    return _made(out_engine, _create('engine'));
+  }
+
+  /// ML Drift's [kind] cache of the 37-byte test model, as LiteRT's WebGPU
+  /// accelerator names it: `<file>.text_encoder_<mtime s>_<size>_mldrift_…`.
+  void _writeGpuCache(String dir, String kind) {
+    File(
+        '$dir/eg2.litertlm.text_encoder_1791758581_37_mldrift_${kind}_cache.bin',
+      ).openSync(mode: FileMode.write)
+      ..truncateSync(cacheFileBytes)
+      ..closeSync();
+  }
+
+  /// The towers XNNPack writes a weight cache for at create, as upstream
+  /// decides: every tower the bundle has gets an executor (NULL tower backends
+  /// run on the main one, a set one on itself), and a tower on CPU writes a
+  /// cache while one on the NPU writes none.
+  List<String> _cachedTowers() {
+    final main = settingsBackend;
+    final path = settingsModelPath;
+    bool hasAudio() {
+      if (path == null) return false;
+      try {
+        return litertlmHasAudioEncoder(readLitertlmModelTypes(path));
+      } on FormatException {
+        return false; // the plain test file: no container, no audio tower
+      }
+    }
+
+    return [
+      if (main == 'cpu') 'text_encoder',
+      if ((settingsVisionBackend ?? main) == 'cpu' &&
+          (visionSignatures?.any((length) => length > 0) ?? false))
+        'vision_encoder',
+      if ((settingsAudioBackend ?? main) == 'cpu' && hasAudio())
+        'static_audio_encoder',
+    ];
+  }
+
+  @override
+  void litert_lm_embedding_engine_delete(
+    Pointer<LiteRtLmEmbeddingEngine> engine,
+  ) {
+    _call('engine_delete', 'litert_lm_embedding_engine_delete');
+    _delete('engine', engine);
+  }
+
+  // ── options ──
+  @override
+  int litert_lm_embedding_options_create(
+    Pointer<Pointer<LiteRtLmEmbeddingOptions>> out_options,
+  ) {
+    _call('options_create', 'litert_lm_embedding_options_create');
+    // `new` in C++: it fails only on a NULL out-parameter, setting no error.
+    return failOptions
+        ? _invalidArgument
+        : _made(out_options, _create('options'));
+  }
+
+  @override
+  void litert_lm_embedding_options_delete(
+    Pointer<LiteRtLmEmbeddingOptions> options,
+  ) {
+    _call('options_delete', 'litert_lm_embedding_options_delete');
+    _delete('options', options);
+  }
+
+  @override
+  int litert_lm_embedding_options_set_normalize(
+    Pointer<LiteRtLmEmbeddingOptions> options,
+    bool normalize,
+  ) {
+    _call('options_set_normalize', 'litert_lm_embedding_options_set_normalize');
+    this.normalize = normalize;
+    return 0;
+  }
+
+  @override
+  int litert_lm_embedding_options_set_insert_special_tokens(
+    Pointer<LiteRtLmEmbeddingOptions> options,
+    bool insert_special_tokens,
+  ) {
+    _call(
+      'options_set_insert_special_tokens',
+      'litert_lm_embedding_options_set_insert_special_tokens',
+    );
+    insertSpecialTokens = insert_special_tokens;
+    return 0;
+  }
+
+  @override
+  int litert_lm_embedding_options_set_input_overflow_strategy(
+    Pointer<LiteRtLmEmbeddingOptions> options,
+    LiteRtLmInputOverflowStrategy strategy,
+  ) {
+    _call(
+      'options_set_input_overflow_strategy',
+      'litert_lm_embedding_options_set_input_overflow_strategy',
+    );
+    overflowStrategy = strategy;
+    return 0;
+  }
+
+  // ── inputs, compute, response ──
+  @override
+  int litert_lm_input_data_create(
+    LiteRtLmInputDataType type,
+    Pointer<Void> data,
+    int size,
+    Pointer<Pointer<LiteRtLmInputData>> out_input_data,
+  ) {
+    _call('input_data_create', 'litert_lm_input_data_create');
+    if (failInputData) return _invalidArgument; // sets no error, as upstream
+    if (_inputDataCalls++ == failInputDataAt) return _invalidArgument;
+    // Copied, as upstream does: the pass frees its buffer right after.
+    final bytes = Uint8List.fromList(data.cast<Uint8>().asTypedList(size));
+    final handle = _create<LiteRtLmInputData>('input_data');
+    _inputs[handle.address] = (type, bytes);
+    return _made(out_input_data, handle);
+  }
+
+  @override
+  void litert_lm_input_data_delete(Pointer<LiteRtLmInputData> input_data) {
+    _call('input_data_delete', 'litert_lm_input_data_delete');
+    _delete('input_data', input_data);
+    _inputs.remove(input_data.address);
+  }
+
+  @override
+  int litert_lm_embedding_engine_compute_embedding(
+    Pointer<LiteRtLmEmbeddingEngine> engine,
+    Pointer<Pointer<LiteRtLmInputData>> inputs,
+    int num_inputs,
+    Pointer<LiteRtLmEmbeddingOptions> options,
+    Pointer<Pointer<LiteRtLmEmbeddingResponse>> out_response,
+  ) {
+    _call('compute_embedding', 'litert_lm_embedding_engine_compute_embedding');
+    if (!(live['engine']?.contains(engine.address) ?? false)) {
+      throw StateError('compute on a dead engine');
+    }
+    if (!(live['options']?.contains(options.address) ?? false)) {
+      throw StateError('compute with dead options');
+    }
+    final parts = [
+      for (var i = 0; i < num_inputs; i++) _inputs[inputs[i].address]!,
+    ];
+    lastPartTypes = [for (final (type, _) in parts) type];
+    lastParts = [for (final (_, bytes) in parts) bytes];
+    // A text part must be valid UTF-8: decoding throws otherwise.
+    lastTexts = [
+      for (final (type, bytes) in parts)
+        if (type == LiteRtLmInputDataType.kLiteRtLmInputDataTypeText)
+          utf8.decode(bytes),
+    ];
+    final dir = cacheDir;
+    if (gpuProgramCacheOnCompute &&
+        writeCacheOnCreate &&
+        dir != null &&
+        !omitGpuCaches.contains('program') &&
+        !File(
+          '$dir/eg2.litertlm.text_encoder_1791758581_37_mldrift_program_cache.bin',
+        ).existsSync()) {
+      _writeGpuCache(dir, 'program');
+    }
+    final failure = failCompute;
+    if (failure != null) return _fail(failure, out_response);
+    // OK with no response: a failure that reports nothing.
+    if (silentNullCompute) return _made(out_response, nullptr);
+    final response = _create<LiteRtLmEmbeddingResponse>('response');
+    final n = responseSize ?? dimension;
+    final values = calloc<Float>(n);
+    final vector = <double>[];
+    for (var i = 0; i < n; i++) {
+      values[i] = vectorOverride?[i] ?? (i + 1) * 0.25 + lastParts.first.length;
+      vector.add(values[i]);
+    }
+    lastVector = vector;
+    _vectors[response.address] = values;
+    return _made(out_response, response);
+  }
+
+  @override
+  int litert_lm_embedding_response_get_size(
+    Pointer<LiteRtLmEmbeddingResponse> response,
+    Pointer<Size> out_size,
+  ) {
+    _call('response_get_size', 'litert_lm_embedding_response_get_size');
+    out_size.value = responseSize ?? dimension;
+    return 0;
+  }
+
+  @override
+  int litert_lm_embedding_response_get_input_length(
+    Pointer<LiteRtLmEmbeddingResponse> response,
+    Pointer<Int> out_input_length,
+  ) {
+    _call(
+      'response_get_input_length',
+      'litert_lm_embedding_response_get_input_length',
+    );
+    // A negative count is what a getter that fails leaves the pass with.
+    if (responseInputLength < 0) return _invalidArgument;
+    out_input_length.value = responseInputLength;
+    return 0;
+  }
+
+  @override
+  int litert_lm_embedding_response_get_truncated_length(
+    Pointer<LiteRtLmEmbeddingResponse> response,
+    Pointer<Int> out_truncated_length,
+  ) {
+    _call(
+      'response_get_truncated_length',
+      'litert_lm_embedding_response_get_truncated_length',
+    );
+    if (responseTruncatedLength < 0) return _invalidArgument;
+    out_truncated_length.value = responseTruncatedLength;
+    return 0;
+  }
+
+  @override
+  int litert_lm_embedding_response_get_values(
+    Pointer<LiteRtLmEmbeddingResponse> response,
+    Pointer<Pointer<Float>> out_values,
+  ) {
+    _call('response_get_values', 'litert_lm_embedding_response_get_values');
+    out_values.value = _vectors[response.address]!;
+    return 0;
+  }
+
+  @override
+  void litert_lm_embedding_response_delete(
+    Pointer<LiteRtLmEmbeddingResponse> response,
+  ) {
+    _call('response_delete', 'litert_lm_embedding_response_delete');
+    _delete('response', response);
+    final values = _vectors.remove(response.address);
+    if (values != null) calloc.free(values);
+  }
+}
+
+/// [calloc], counting what is still allocated.
+final class _CountingAllocator implements Allocator {
+  int live = 0;
+
+  @override
+  Pointer<T> allocate<T extends NativeType>(int byteCount, {int? alignment}) {
+    live++;
+    return calloc.allocate<T>(byteCount, alignment: alignment);
+  }
+
+  @override
+  void free(Pointer<NativeType> pointer) {
+    live--;
+    calloc.free(pointer);
+  }
+}

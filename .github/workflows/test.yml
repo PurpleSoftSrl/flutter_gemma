@@ -9,6 +9,105 @@ on:
 jobs:
   analyze-and-test:
     runs-on: ubuntu-latest
+    # The full workspace run is ~25 min locally. Without an explicit limit a
+    # stuck `pub get` would sit on GitHub's 6-hour default, which reads as
+    # "still running" rather than "broken".
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Warns on codelab web copies that are missing or differ from this repo's
+      # packages/*/web; fails only if the check itself cannot run. First, and
+      # needing no Flutter, so a red test further down cannot hide it. The
+      # script's header says why the copies are synced after a publish.
+      - name: Codelab web copies vs this repo's web bundles
+        run: tool/check_codelab_web_copies.sh
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+          cache: true
+
+      # Pub workspace: one root resolve covers every package.
+      - name: Install dependencies
+        run: flutter pub get
+
+      # Before the tests, so a red test cannot hide it (~4 s). The tests read
+      # assets from the repo; only the published archive can show one missing.
+      # Every flutter_edge_ai_agent release up to 0.2.6 shipped without its
+      # SKILL.md files and every check here was green (#578).
+      - name: Published packages carry their runtime files
+        run: dart tool/check_published_assets.dart
+
+      - name: Verify formatting
+        run: dart format --output=none --set-exit-if-changed .
+
+      # Every workspace package, not just the core one — but scoped to
+      # packages/ rather than the repo root. `website/` is a Jaspr app that is
+      # deliberately NOT in the workspace list, so the root `pub get` never
+      # resolves its dependencies and analyzing it from the root fails on its
+      # own generated brand code. That passes locally on any machine where the
+      # site has been built once, which is exactly why it has to be scoped
+      # here instead of relying on a dev checkout.
+      - name: Analyze code
+        run: flutter analyze packages/ --no-fatal-infos
+
+      # Core publishes five libraries (flutter_edge_ai, engine, engine_io,
+      # engine_web, genai); lib/src is private. The analyzer's
+      # implementation_imports lint (an error in every analysis_options.yaml)
+      # only sees files under lib/; this script also covers tests, examples and
+      # tools, and prints the annotated exceptions so they are reviewed in one
+      # place. tool/test_all.sh runs it too; this step names the failure.
+      - name: Core public surface
+        run: tool/check_core_surface.sh
+
+      # The web compilers do not reject a native import that leaks into the web
+      # graph (dart2js lists dart:io and dart:isolate, dart2wasm accepts all
+      # three); it compiles and fails at runtime. This walks the import graph
+      # from every public library, taking the web branch of each conditional
+      # directive, and fails on dart:io, dart:ffi or dart:isolate.
+      - name: Web import graph
+        run: dart tool/check_web_graph.dart
+
+      # The C shim between LiteRT-LM and Dart has its own host test: fake
+      # libraries opened the way Dart opens the real one, under ThreadSanitizer.
+      - name: StreamProxy host test
+        run: packages/flutter_edge_ai_litertlm/native/litert_lm/run_stream_proxy_test.sh
+
+      # The MediaTek dispatch adapter (versioned dispatch ABI over Google's
+      # legacy dispatch): a fake legacy dispatch queried the way LiteRT does,
+      # and a one-slot-shifted adapter that must fail.
+      - name: MediaTek dispatch adapter host test
+        run: packages/flutter_edge_ai_litertlm/native/litert_lm/run_mediatek_dispatch_compat_test.sh
+
+      # Every package that has tests, each run from its OWN directory. The loop
+      # lives in tool/test_all.sh so CI and the local "before committing"
+      # command are the same code — a second copy here would drift, which is
+      # the exact failure the release skill's rule 1f exists to prevent.
+      - name: Run tests (all packages)
+        run: tool/test_all.sh --coverage
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: ./packages/flutter_edge_ai/coverage/lcov.info
+          fail_ci_if_error: false
+        continue-on-error: true
+
+  # The skills shipped inside flutter_edge_ai are read by other people's coding
+  # agents, so a wrong name there becomes confident, broken code in someone
+  # else's app. Two gates, both fail-closed, and neither ran in CI before:
+  #   check_skills.dart compiles every ```dart fence and every inline type in
+  #   the prose against the real packages using the core example and workspace
+  #   contexts, including opt-in engines absent from the core example app;
+  #   skills_lint checks the files themselves (frontmatter, name, description
+  #   budget, relative links), with the rules set in skills_lint.yaml.
+  skills:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     steps:
       - name: Checkout code
@@ -23,22 +122,85 @@ jobs:
       - name: Install dependencies
         run: flutter pub get
 
-      - name: Verify formatting
-        run: dart format --output=none --set-exit-if-changed .
-        continue-on-error: true
+      - name: Resolve the example app
+        run: flutter pub get
+        working-directory: packages/flutter_edge_ai/example
 
-      - name: Analyze code
-        run: flutter analyze --no-fatal-infos
+      - name: Compile every code block in the skills
+        run: dart tool/check_skills.dart
 
-      - name: Run tests
-        run: flutter test --coverage
+      - name: Lint the skill files
+        run: dart run skills_lint@0.5.3
 
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v4
+  # The model registry (model_registry/README.md): every rule
+  # `registry.dart check` applies — the schema, the facts read from the files'
+  # bytes, the documented claims, the recorded evidence — and that every file
+  # `generate` writes is current: the Dart catalogs in flutter_edge_ai_litertlm
+  # and flutter_edge_ai_speech, the website's registry page, models.json and
+  # the Models page's generated table. Full history: a docs claim cites lines at
+  # a commit, which check reads with git. Whether Hugging Face still serves the
+  # pinned files is model-registry-live.yml's job, not a pull request's.
+  model-registry:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
         with:
-          files: ./coverage/lcov.info
-          fail_ci_if_error: false
-        continue-on-error: true
+          fetch-depth: 0
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+          cache: true
+
+      - name: Check the registry and its generated files
+        working-directory: tool/model_registry
+        run: |
+          dart pub get
+          dart run bin/registry.dart check
+          dart test
+
+  # The analyzer and the public-surface golden see only the NATIVE branch of
+  # conditional imports and exports, so a web arm that no longer compiles (a
+  # moved file, a renamed symbol, a signature that drifted from its native
+  # twin) shows up only here. Both compilers, because dart2wasm rejects code
+  # dart2js accepts (e.g. JS-interop type checks). What these builds do NOT
+  # catch is a native library leaking into the web graph: dart2js accepts
+  # direct dart:io and dart:isolate imports and dart2wasm accepts dart:ffi too,
+  # so such a leak compiles and fails at runtime. That is the job of
+  # tool/check_web_graph.dart (analyze job).
+  build-example-web:
+    runs-on: ubuntu-latest
+    needs: analyze-and-test
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+          cache: true
+
+      - name: Install plugin dependencies
+        run: flutter pub get
+
+      - name: Install example dependencies
+        working-directory: packages/flutter_edge_ai/example
+        run: flutter pub get
+
+      - name: Build example web (dart2js)
+        working-directory: packages/flutter_edge_ai/example
+        run: flutter build web
+
+      - name: Build example web (dart2wasm)
+        working-directory: packages/flutter_edge_ai/example
+        run: flutter build web --wasm
 
   build-example-android:
     runs-on: ubuntu-latest
@@ -58,25 +220,38 @@ jobs:
         uses: actions/setup-java@v4
         with:
           distribution: 'zulu'
-          java-version: '17'
+          # AGP 9.3's lint calls java.util.List.removeLast() (Java 21) and
+          # crashes on 17 in lintVitalAnalyzeRelease.
+          java-version: '21'
           cache: 'gradle'
 
       - name: Install plugin dependencies
+        working-directory: packages/flutter_edge_ai
         run: flutter pub get
 
       - name: Install example dependencies
-        working-directory: example
+        working-directory: packages/flutter_edge_ai/example
         run: flutter pub get
 
+      # The example sets qualcomm_npu, so the litertlm hook fetches
+      # com.qualcomm.qti:qnn-runtime (71 MB) from Maven Central. Cache entries
+      # are immutable (version, sha256 and format are in the name), so the file
+      # that pins them is the whole key.
+      - name: Cache Qualcomm QNN runtime
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/flutter_gemma/native/qnn
+          key: qnn-runtime-${{ hashFiles('packages/flutter_edge_ai_litertlm/lib/src/hook/qnn_runtime.dart') }}
+
       - name: Build example APK
-        working-directory: example
+        working-directory: packages/flutter_edge_ai/example
         run: flutter build apk --release
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: example-app-debug
-          path: example/build/app/outputs/flutter-apk/app-release.apk
+          path: packages/flutter_edge_ai/example/build/app/outputs/flutter-apk/app-release.apk
           retention-days: 7
 
   build-example-ios:
@@ -94,13 +269,117 @@ jobs:
           cache: true
 
       - name: Install plugin dependencies
+        working-directory: packages/flutter_edge_ai
         run: flutter pub get
 
       - name: Install example dependencies
-        working-directory: example
+        working-directory: packages/flutter_edge_ai/example
         run: flutter pub get
 
       - name: Build example iOS (no signing)
-        working-directory: example
+        working-directory: packages/flutter_edge_ai/example
         run: flutter build ios --release --no-codesign
         continue-on-error: true
+
+  build-example-macos:
+    runs-on: macos-latest
+    needs: analyze-and-test
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+          cache: true
+
+      - name: Install plugin dependencies
+        working-directory: packages/flutter_edge_ai
+        run: flutter pub get
+
+      - name: Install example dependencies
+        working-directory: packages/flutter_edge_ai/example
+        run: flutter pub get
+
+      # The companion-staging script is covered by hermetic tests that are
+      # @TestOn('mac-os'): they build throwaway Mach-O files with clang and
+      # assert bundle closure. analyze-and-test runs on ubuntu and skips them,
+      # and the example builds below do NOT reproduce #457 — the example's
+      # build order never relocates the dependency before the phase runs, so
+      # the old hardcoded logic passed there too. This step is the only place
+      # in CI where the fix is actually executed.
+      - name: Test flutter_edge_ai_litertlm (macOS-only suites included)
+        working-directory: packages/flutter_edge_ai_litertlm
+        run: flutter test
+
+      # Build twice: the macOS companion-dylib staging is patched by a
+      # CocoaPods build phase that the always-out-of-date Flutter embed phase
+      # clobbers. A single build masks the bug (the phase runs last on a clean
+      # build); the second incremental build is where a stale-stamped phase
+      # would ship an unpatched LiteRtLm (#368). Both must leave the embedded
+      # binary referencing the framework-form companion, not the raw dylib.
+      # CI has no signing identity; disable Xcode code-signing via the
+      # FLUTTER_XCODE_* passthrough. The staging phase re-signs the patched
+      # binary ad-hoc (`codesign --sign -`) itself, so this doesn't affect it.
+      - name: Build example macOS (clean)
+        working-directory: packages/flutter_edge_ai/example
+        run: flutter build macos --debug
+        env:
+          FLUTTER_XCODE_CODE_SIGNING_ALLOWED: 'NO'
+          FLUTTER_XCODE_CODE_SIGNING_REQUIRED: 'NO'
+          FLUTTER_XCODE_CODE_SIGN_IDENTITY: ''
+
+      - name: Build example macOS (incremental)
+        working-directory: packages/flutter_edge_ai/example
+        run: flutter build macos --debug
+        env:
+          FLUTTER_XCODE_CODE_SIGNING_ALLOWED: 'NO'
+          FLUTTER_XCODE_CODE_SIGNING_REQUIRED: 'NO'
+          FLUTTER_XCODE_CODE_SIGN_IDENTITY: ''
+
+      - name: Assert LiteRtLm links the framework-form companion, not the raw dylib
+        working-directory: packages/flutter_edge_ai/example
+        run: |
+          LITERTLM="build/macos/Build/Products/Debug/flutter_edge_ai_example.app/Contents/Frameworks/LiteRtLm.framework/Versions/A/LiteRtLm"
+          if [ ! -f "$LITERTLM" ]; then
+            echo "::error::LiteRtLm binary not found at $LITERTLM"
+            exit 1
+          fi
+          DEPS="$(otool -L "$LITERTLM")"
+          echo "$DEPS" | grep -i GemmaModelConstraint || true
+          if echo "$DEPS" | grep -q "@rpath/libGemmaModelConstraintProvider.dylib"; then
+            echo "::error::#368 regression — LiteRtLm still references the raw dylib after the incremental build; the Setup phase did not re-apply the install_name patch."
+            exit 1
+          fi
+          if ! echo "$DEPS" | grep -q "GemmaModelConstraintProvider.framework"; then
+            echo "::error::LiteRtLm does not reference the framework-form companion; staging did not run."
+            exit 1
+          fi
+          echo "OK: LiteRtLm references the framework-form GemmaModelConstraintProvider."
+
+  # The Windows reader calls kernel32 through dart:ffi; the host group of
+  # test/windows_memory_test.dart is skipped everywhere else, so this job is
+  # the only place in CI where it runs.
+  test-diagnostics-windows:
+    runs-on: windows-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+          cache: true
+
+      - name: Install dependencies
+        working-directory: packages/flutter_edge_ai_diagnostics
+        run: flutter pub get
+
+      - name: Test flutter_edge_ai_diagnostics (Windows host group included)
+        working-directory: packages/flutter_edge_ai_diagnostics
+        run: flutter test

@@ -1,0 +1,1039 @@
+# Migration guide
+
+## Unreleased: Hugging Face resolvers per role
+
+- A `HuggingFaceResolver` implementation adds the role it serves:
+  `@override ModelManagementType get type => ModelManagementType.inference;`
+  for a language-model resolver (`embedding`, `stt` or `tts` for the others).
+  `initialize` throws `StateError` for a provider whose
+  `HuggingFaceResolverSource` resolver serves another role than the list it
+  is passed in.
+- `ResolvedHfModel.modelType` is `family`, a `ModelFamily` (`ModelType`,
+  `SttModelType` or `TtsModelType`). A resolver passes `family:`; an app that
+  read the language-model family casts it:
+  `r.family as ModelType? ?? ModelType.general`. The installer of
+  `installModel` throws `StateError` for a family that is not a `ModelType`.
+- `resolveHuggingFace` takes `type:` (default `inference`); apps that call it
+  for a language model change nothing.
+- `getActiveEmbedder`'s `supportImage` and `supportAudio` are `bool?`: an
+  omitted argument takes the `defaults:` value, then `false` as before. A
+  subclass of `EmbedderVariant`, `SttVariant` or `TtsVariant` inherits a
+  `runtimeDefaults` it may override.
+- A language-model directory install (`installModel(...).fromHuggingFace`)
+  checks each member's size when the resolver gives one, as catalog and
+  embedder installs do, and then also refuses to write over the files of the
+  active model: close and `uninstallModel` the active model before installing
+  another revision into the same directory. The ONNX resolver gives no sizes
+  yet, so its installs are unchanged.
+
+## flutter_edge_ai 2.6.0
+
+### Typed responses
+
+`openSession` and `openChat` now take `responseFormat:`. `createSession` and
+`createChat` do not: move a conversation that needs constrained JSON to
+`openSession` / `openChat`, keep the returned session/chat, and close it
+yourself. Check the loaded model with `structuredOutputSupport` and
+`refusalFor(format)` first; support depends on the engine, platform and active
+backend.
+
+A refused format throws `ResponseFormatUnsupportedException`. If a structured
+generation's text closes normally but its `TurnEnd` is `outputLimit`,
+`contextLimit`, `stopped` or `closed`, `IncompleteStructuredOutputException`
+carries that end and `partialText`; a refused input that never fit the context
+fails with `ContextLimitException` instead. A normally ended reply that is not
+exactly one JSON value matching the schema throws
+`NonConformingStructuredOutputException`. On an incremental engine the text
+chunks arrive before the final validation error;
+`StructuredOutputSupport.delivery == StructuredDelivery.buffered` means one
+complete chunk. Formats cannot be combined with tools or
+`enableThinking: true`.
+
+### Open sessions and chats
+
+`createSession`, `createChat`, `session` and `chat` are deprecated and will be
+removed in 3.0.0. Keep the handle returned by `openSession` or `openChat`, and
+close it when done.
+
+Before:
+
+```dart
+final model = await FlutterEdgeAi.getActiveModel();
+final session = await model.createSession();
+await session.addQueryChunk(Message(text: prompt, isUser: true));
+final reply = await session.getResponse();
+// A later createSession() closed this session implicitly.
+```
+
+After:
+
+```dart
+final model = await FlutterEdgeAi.getActiveModel();
+final session = await model.openSession();
+try {
+  await session.addQueryChunk(Message(text: prompt, isUser: true));
+  final reply = await session.getResponse();
+} finally {
+  await session.close();
+}
+```
+
+For a chat, make the same ownership explicit:
+
+```dart
+final chat = await model.openChat();
+try {
+  await chat.addQueryChunk(Message(text: prompt, isUser: true));
+  final reply = await chat.generateChatResponse();
+} finally {
+  await chat.close();
+}
+```
+
+The behavior differs intentionally: `createSession` closed the previous
+singleton session, while `openSession` does not close any prior session. Every
+open session remains live and counts against `maxConcurrentSessions` until it
+or its model is closed. Do not rename a per-turn `createSession` call to
+`openSession` without retaining and closing the returned handle; that leaks one
+session per turn and eventually reaches the concurrency cap (or exhausts
+memory). The same ownership rule applies to `openChat`.
+
+### `implements InferenceModel`
+
+A class that `implements InferenceModel` declares two new members,
+`readDecisionSection` and `openOptionScorer`: fail both with
+`DeciderUnsupportedException`. A class that `extends InferenceModel` inherits
+defaults that do. An engine that mixed in `OptionScoringModel`, which is
+removed, drops the mixin and keeps its two overrides.
+
+A class that `implements InferenceModel` also declares four new members, all in
+`package:flutter_edge_ai/engine.dart`: `openEngineSession(SessionRequest)` (fail
+it with `UnsupportedError` if the class opens no independent sessions),
+`resolveChatRequest(ChatRequest)`,
+`createChatTurnHooks(ResolvedChatRequest)` (return `ChatTurnHooks()` for core
+behavior), and `engineSessions`. `openEngineSession` serves both `openSession`
+and every initial or rebuilt `openChat` session. `resolveChatRequest` fills only
+unset values, preserves caller-set values, and must carry `responseFormat`
+unchanged. `engineSessions` returns the legacy session plus every still-open
+independent engine session. A class that `extends InferenceModel` inherits
+core's defaults. Move overrides of `openSession`, `openChat`, and `sessions` to
+those SPI members.
+
+For typed responses it also declares `structuredOutputSupport` and
+`refusalFor(ResponseFormat)`, which core implements once for every class that
+`extends InferenceModel`, and the engine SPI behind them,
+`engineStructuredOutputSupport` and `engineRefusalFor(JsonSchemaResponseFormat)`;
+its `openSession` and `openChat` take `ResponseFormat? responseFormat`. Such a
+class gets none of core's format checks, so it should refuse every format:
+`StructuredOutputSupport.none(reason)`, and from `refusalFor` a
+`ResponseFormatUnsupportedException`, which `openSession` and `openChat`
+throw when a format is passed.
+
+### `implements InferenceModelSession`
+
+A class that `implements InferenceModelSession` declares `startTurn()`,
+returning an `EngineTurn` (from `package:flutter_edge_ai/engine.dart`):
+`EngineTurn(text: getResponseAsync(), end: null)` when it cannot say how a
+turn ended. A class that `extends InferenceModelSession` inherits that.
+
+### Chat turns
+
+`InferenceChat.generateChatResponse` and `generateChatResponseAsync` are
+`@nonVirtual`: a subclass that overrides them, an app's test fake among
+them, gets an `invalid_override_of_non_virtual_member` warning. Script the
+turns through `InferenceChat(turnHooks:)` instead, with a `ChatTurnHooks`
+subclass whose `responses` returns the turn's stream, and give a chat built
+with `sessionCreator: null` a session (`chat.session = …`), which the hooks
+receive.
+
+### A failed chat turn commits nothing
+
+When the engine fails a turn of an `InferenceChat` (its text ends with an
+error), the messages staged for that turn, and any tool call the turn had
+committed, are taken back out of `fullHistory` before the error reaches the
+caller; up to 2.5.x they stayed. `generateChatResponseWithTools` then answers
+no tool call of that turn. Both hold for core's turns; an engine that runs
+its turns through `ChatTurnHooks.responses` (llama) keeps its own history
+and its committed calls are answered as before. A stop or a cancelled
+subscription is not a failure and keeps what was generated, except a stop
+before any text: such a turn is taken back as well.
+
+`ContextLimitException` has one precise meaning: the input did not fit what
+remained of the context window, so neither the input nor a reply was committed.
+Its `EngineTurn.end` is `TurnEnd.contextLimit`; resend a shorter input or start
+the chat over. A turn may also end cleanly with `TurnEnd.contextLimit` when
+generation fills the context during decoding. That case has no stream error and
+keeps its input and partial reply. With a `responseFormat`, the clean cut is
+reported as
+`IncompleteStructuredOutputException(end: TurnEnd.contextLimit, partialText: ...)`.
+
+The engine session must mirror the same take-back. After any error on a turn's
+text, restore its context to before the turn, or make the session unusable if it
+cannot be restored. Do the same for a stopped turn that emitted no non-empty
+text. A stop after text, `outputLimit`, and a decode that reaches `contextLimit`
+keep the partial exchange; a refused input fails with `ContextLimitException`
+plus `TurnEnd.contextLimit` and commits nothing.
+
+## flutter_edge_ai 2.5.x: engines that keep core below 2.6.0
+
+> These versions require `flutter_edge_ai` `<2.6.0`, so `flutter pub upgrade` keeps
+> core on 2.5.x until each engine moves to its next line:
+> `flutter_edge_ai_litertlm` 1.19.2 · `flutter_edge_ai_mediapipe` 1.2.6 ·
+> `flutter_edge_ai_builtin_ai` 0.3.8 · `flutter_edge_ai_onnx` 0.8.0 ·
+> `flutter_edge_ai_llama` 0.0.6 · `flutter_edge_ai_speech` 0.5.14 (also
+> `flutter_edge_ai_litertlm` `<1.20.0`) · `genkit_flutter_edge_ai` 0.11.0+.
+> App code does not change.
+
+## flutter_edge_ai 2.5.0: several open models, removed and deprecated members, embedding providers
+
+### Removed members
+
+| Removed | Use |
+|---|---|
+| `EmbeddingModel.generateEmbedding(t)` | `embed(EmbeddingInput.text(t), taskType: TaskType.retrievalQuery)` |
+| `EmbeddingModel.generateEmbeddings(ts)` | `embedAll([for (final t in ts) EmbeddingInput.text(t)], taskType: TaskType.retrievalQuery)` |
+| `EmbeddingModel.getDimension()` | `dimension` |
+| `InferenceModelSpec.fromLegacyUrl(name:, modelUrl:, loraUrl:)` | `InferenceModelSpec(name: …, modelSource: …, loraSource: …, modelType: …)` |
+
+The removed embedding methods embedded as `TaskType.retrievalQuery` unless given
+a `taskType:`; pass the same task to keep their vectors.
+`genkit_flutter_edge_ai` 0.9.0 and older call `generateEmbeddings` and do not
+compile against 2.5.0: upgrade it to 0.9.1 or later. For `fromLegacyUrl`, use
+the `ModelSource` that matches the URL: `ModelSource.network(url)` for
+`http(s)://`, `ModelSource.asset(path)` for `asset://` or a bare path,
+`ModelSource.bundled(name)` for `native://`, `ModelSource.file(path)` for
+`file://`. The factory defaulted to `modelType: ModelType.general`.
+
+### `FlutterEdgeAiPlugin.createModel` is deprecated
+
+`FlutterEdgeAiPlugin.instance.createModel(modelType:, fileType:, …)` is
+deprecated and removed in 3.0.0. On Android, iOS and desktop it ignored
+`modelType` and `fileType` and returned the active model, which is what
+`FlutterEdgeAi.getActiveModel()` returns. The two ways to get a model are on
+`FlutterEdgeAi`:
+
+| Before | After |
+|---|---|
+| `FlutterEdgeAiPlugin.instance.createModel(modelType: …, maxTokens: …)` | `FlutterEdgeAi.getActiveModel(maxTokens: …)` |
+| several models through `src/` imports | `FlutterEdgeAi.openModel(spec, …)` on a spec from `install(activate: false)`, with `LiteRtLmEngine` (`flutter_edge_ai_litertlm` 1.16.0) |
+
+### Embedding providers: `.gguf` without a tokenizer, accelerators
+
+Embedding specs accept `.gguf` without a separate tokenizer. For an opaque URL,
+use `modelFromNetwork(url, filename: 'model.gguf')`. Old `.gguf` plus tokenizer
+specs are now refused during installation and stored-identity restoration; no
+published backend produced those pairs. Other model/tokenizer pairs and existing
+`.litertlm` identity schemas keep their behavior. No GGUF embedding backend ships
+yet; a separate engine package is required to execute these files.
+
+Follow-on: `flutter_edge_ai_llama` 0.0.3 adds the opt-in
+`LlamaEmbeddingBackend` for native EmbeddingGemma 2 GGUF text embeddings using
+the core 2.5.0 embedding SPI and llamadart 0.15.1. Register it through
+`FlutterEdgeAi.initialize(embeddingBackends:)` and install the GGUF alone.
+Keep a separate RAG vector profile from LiteRT; matching dimensions are not
+vector compatibility. `flutter_edge_ai_embeddings` remains tokenizer-only.
+The statement above describes availability at the core 2.5.0 release.
+
+Engine authors declare explicit accelerator capabilities through
+`EmbeddingBackendProvider.honouredBackends(spec)`; core computes cache identity.
+Automatic requests reuse only a non-NPU embedder for the same installed model
+and media; explicit NPU requests always retain a separate key. Repeated explicit
+CPU/GPU requests reuse their originating model, including a fallback, until a
+rebuild is needed or the model is closed. A fallback warning is printed once per
+new load, including reporting-provider NPU fallbacks. GPU-capable
+providers must report the loaded accelerator in `EmbeddingPassInfo.activeBackend`.
+Existing providers using the default capability set retain descriptor fallback,
+including the fixed WebGPU-only LiteRT-LM path.
+
+`maxInputTokens` is the effective limit accepted by the loaded pass, including
+context and single-pass batch limits, task prefixes and special tokens. A null
+limit means unknown, not unlimited. GGUF's configured 1024-token context and
+micro-batch can be smaller than a model file's theoretical limit; advertising
+that larger limit would let RAG choose chunks the runtime cannot execute.
+Existing providers' numeric limits do not change. Inputs are never truncated.
+
+## flutter_edge_ai 2.4.1 / flutter_edge_ai_litertlm 1.15.0: `npu` on a generic bundle runs on the GPU or the CPU
+
+```yaml
+dependencies:
+  flutter_edge_ai: ^2.4.1
+  flutter_edge_ai_litertlm: ^1.15.0
+```
+
+Only apps that pass `PreferredBackend.npu` with a generic `.litertlm` — one
+compiled for no NPU: no `tf_lite_aux` section and no `LiteRtStamp` on its text
+model — need to act. Where 1.14.0 tried such a bundle on the NPU, LiteRT ran it
+on the CPU while `activeBackend` said `npu`. 1.15.0 never tries the NPU for it
+([Where a model runs](https://pub.dev/packages/flutter_edge_ai_litertlm#where-a-model-runs)):
+
+- `npu` falls back to the GPU, then the CPU: the log says why, and
+  `activeBackend` names the backend that ran.
+- With `LiteRtLmEngine(backendFallback: false)` the load is refused with a
+  `LiteRtLmBundleException` (`wrongBackend`). Ask for `gpu` or `cpu`, or
+  install the bundle compiled for your device's NPU.
+
+A `.litertlm` the reader cannot read keeps the old rules.
+
+Google Tensor G5/G6 bundles run on the NPU of a Pixel with that Tensor
+generation and Android 16 or later (not a `BP2A` build). It is opt-in, as
+Qualcomm's is: `google_tensor_npu: true` in the same `user_defines` block.
+Without it such a bundle fails with a `BackendInitException` that says how to
+enable it.
+
+## `flutter_edge_ai_agent` 0.4.0: `schedule_notification` is opt-in
+
+```yaml
+dependencies:
+  flutter_edge_ai_agent: ^0.4.0
+```
+
+`NativeIntentExecutor()` no longer schedules notifications: the intent returns
+an error until the app passes `NotificationIntentSettings`. Before, it
+scheduled whether or not the app had called `initialize`, and without it the
+app crashed: on macOS when the intent scheduled, on Android when the reminder
+fired with no small icon. An app that uses the intent:
+
+1. calls `FlutterLocalNotificationsPlugin().initialize(...)` once at startup,
+   with its own callbacks, its default icon and settings for every platform it
+   builds for (`initialize` throws without them) — the agent never does;
+2. passes `NativeIntentExecutor(notifications: const NotificationIntentSettings())`;
+3. on Android, declares `SCHEDULE_EXACT_ALARM` and, on Android 14 and newer,
+   asks for it with `requestExactAlarmsPermission()`, or passes
+   `androidExactAlarm: false` for an inexact reminder.
+
+The intent checks the permissions and refuses instead of asking for them, and
+it no longer loads the time zone database, which reset the app's `tz.local`
+to UTC. A `schedule_notification` entry in `handlers:` still replaces the
+built-in intent, but not together with `notifications:`.
+
+Every `schedule_notification` call, an app's own handler included, is now
+refused before it runs when its date is partial (a `day` without `year` and
+`month`) or does not exist (February 31). Without a date, a time that has
+passed today moves to tomorrow at the same wall-clock time, across a clock
+change too. The mail and SMS intents write a space as `%20` instead of `+`.
+See [Agent → Setup](https://flutteredge.ai/docs/agent#setup).
+
+## flutter_edge_ai 2.4.0 / flutter_edge_ai_litertlm 1.14.0: backends follow the model file
+
+> Upgrade these together: `flutter_edge_ai` 2.4.0, `flutter_edge_ai_litertlm`
+> 1.14.0, `flutter_edge_ai_agent` 0.3.0 and `genkit_flutter_edge_ai` 0.10.0.
+> litertlm 1.13.x and genkit 0.9.x compile against core 2.4.0 but ignore
+> `multimodalOrder`, `activeVisionBackend` / `activeAudioBackend` and tool call
+> ids. The other packages are unchanged.
+
+```yaml
+dependencies:
+  flutter_edge_ai: ^2.4.0
+  flutter_edge_ai_litertlm: ^1.14.0
+  flutter_edge_ai_agent: ^0.3.0       # if you use it
+  genkit_flutter_edge_ai: ^0.10.0     # if you use it
+```
+
+### `implements InferenceModel`
+
+A class that `implements InferenceModel` declares three new members:
+`createDecider` (fail it with `DeciderUnsupportedException`), and the getters
+`activeVisionBackend` and `activeAudioBackend` (null when the model has no such
+encoder or the engine does not say). A class that `extends InferenceModel`
+inherits all three.
+
+### Where a `.litertlm` runs
+
+Before it creates an engine, litertlm 1.14.0 reads the bundle's header and
+decides from it
+([Where a model runs](https://pub.dev/packages/flutter_edge_ai_litertlm#where-a-model-runs)).
+What can change for an existing app:
+
+- A bundle compiled for an NPU (e.g. `…_qualcomm_sm8750.litertlm`) with no
+  `preferredBackend` now runs on the NPU. With `PreferredBackend.gpu` or `cpu`
+  it is refused with a `LiteRtLmBundleException` (`wrongBackend`); on a device
+  whose NPU cannot be reached it fails with a `BackendInitException` that names
+  the cause. It is never tried on the GPU or the CPU. A generic bundle with
+  `npu` still falls back to GPU, then CPU.
+- An encoder you leave unset runs where its section says, reported in
+  `activeVisionBackend` / `activeAudioBackend`: Gemma 4 vision and audio on the
+  CPU, Gemma 3n vision on the GPU and its audio on the CPU.
+- `preferredAudioBackend: PreferredBackend.gpu` on Gemma 4 or Gemma 3n is
+  refused with a `LiteRtLmBundleException` (`wrongBackend`): their audio
+  encoders declare `backend_constraint` cpu. Remove it.
+- `preferredVisionBackend: PreferredBackend.cpu` on Gemma 3n is refused the
+  same way: its vision encoder declares gpu only. Remove it.
+- An encoder backend left unset and an explicit `PreferredBackend.cpu` are
+  different requests now: switching between them reloads the model.
+- A download that stopped early is refused before any engine
+  (`LiteRtLmBundleException`, `incomplete`): install the file again.
+
+New and optional: `LiteRtLmEngine(backendFallback: false)` makes one attempt
+and fails with LiteRT-LM's own reason, and `readLiteRtLmBundleInfo(path)` shows
+what the engine reads.
+
+### Gemma 4 gets its audio after the text
+
+litertlm 1.14.0 sends a Gemma 4 message's images, then its text, then its audio
+(`MultimodalOrder.imagesTextAudio`, the order of the model card); every other
+model keeps images, audio, text. Pass
+`getActiveModel(multimodalOrder: MultimodalOrder.imagesAudioText)` to keep the
+old order.
+
+### `flutter_edge_ai_agent` 0.3.0
+
+`EmptyAnswerRetryEvent` is a new `AgentEvent`, so an exhaustive `switch` over
+`AgentEvent` needs a case for it: the loop emits it when it asks again after an
+empty answer that followed `loadSkill` (`emptyAfterSkillRetries`, default 1).
+A turn that stays empty ends with `EmptyAnswerEvent`, a `DoneEvent`.
+
+### `genkit_flutter_edge_ai` 0.10.0
+
+Requires `flutter_edge_ai` ^2.4.0. Tool `ref`s travel as call ids both ways: a
+tool request's `ref` is the call's id (`call_0`, `call_1`, … when it has none),
+and a tool response's `ref` becomes the `toolCallId` of the message it is sent
+back as.
+
+## flutter_edge_ai 2.3.0: the embedding API, EmbeddingGemma 2, RAG 1.1
+
+> **Upgrade every flutter_edge_ai package together** (`flutter pub upgrade`,
+> not `flutter pub upgrade flutter_edge_ai`). Minimum versions with core
+> 2.3.0: `flutter_edge_ai_litertlm` 1.13.0 · `flutter_edge_ai_embeddings`
+> 2.3.0 · `flutter_edge_ai_onnx` 0.5.8 · `flutter_edge_ai_mediapipe` 1.2.2 ·
+> `flutter_edge_ai_builtin_ai` 0.3.5 · `flutter_edge_ai_speech` 0.5.6 ·
+> `flutter_edge_ai_agent` 0.2.9 · `flutter_edge_ai_rag` 1.1.0 ·
+> `flutter_edge_ai_sqlite` 2.1.0 · `flutter_edge_ai_qdrant` 2.1.0. An older
+> one fails to compile inside that package. `genkit_flutter_edge_ai` 0.9.0
+> still compiles; 0.9.1 calls the new API and re-resolves a closed embedder.
+> `flutter_edge_ai_diagnostics` and `genkit_hybrid` are unaffected.
+
+```yaml
+dependencies:
+  flutter_edge_ai: ^2.3.0
+  flutter_edge_ai_litertlm: ^1.13.0
+  flutter_edge_ai_embeddings: ^2.3.0 # EmbeddingGemma 1 and other two-file models
+  flutter_edge_ai_rag: ^1.1.0
+  flutter_edge_ai_sqlite: ^2.1.0     # or flutter_edge_ai_qdrant: ^2.1.0
+```
+
+### Embeddings
+
+`EmbeddingModel` takes an `EmbeddingInput` and a required `TaskType`. The three
+old methods stayed as deprecated forwarders until 2.5.0 removed them.
+
+| Before (2.2) | After (2.3) |
+|---|---|
+| `generateEmbedding(t)` | `embed(EmbeddingInput.text(t), taskType: TaskType.retrievalQuery)`. The task is required; `TaskType.none` embeds the text with no prefix. |
+| `generateEmbeddings(ts)` | `embedAll([for (final t in ts) EmbeddingInput.text(t)], taskType: …)`; it also takes a `cancelToken:`. |
+| `await m.getDimension()` | `m.dimension` |
+| a closed model threw `StateError` synchronously | `EmbedderClosedException`; every embedding error arrives as a failed future. Catch `EmbeddingException` for all of them. |
+| inputs longer than the model's sequence length were truncated without a word (EmbeddingGemma 1 `.tflite`, ONNX static graphs, LiteRT.js on web, SigLIP) | `EmbeddingInputTooLongException(maxInputTokens, actualTokens)`. Chunk your text below `model.maxInputTokens` — task prefix, BOS and EOS included. |
+| `TaskType { retrievalQuery, retrievalDocument }` | seven values appended: `none`, `questionAnswering`, `factChecking`, `codeRetrieval`, `classification`, `clustering`, `sentenceSimilarity`. Add the cases or a default branch to exhaustive switches; the first two keep their index. |
+| `getActiveEmbedder({preferredBackend})` | adds `supportImage` and `supportAudio`: declare media at load. Media sent to a model that did not declare them throws. |
+| `FlutterEdgeAiPlugin.createEmbeddingModel(modelPath:, tokenizerPath:)` | the explicit paths are gone. Install the files with `installEmbedder().modelFromFile(…)` (and `tokenizerFromFile(…)` unless it is a `.litertlm`), then call `getActiveEmbedder()`. |
+| `EmbeddingModelSpec(tokenizerSource:)` was required | `tokenizerSource` is null for a `.litertlm` embedder; check `spec.isSelfContained`. `spec.files` has one entry then. |
+| `installEmbedder()` without a tokenizer always threw | a `.litertlm` installs alone; a tokenizer for a `.litertlm` is an `ArgumentError` before any download, and a model no registered backend can run on this platform is an `UnsupportedError` before any download. |
+
+New and additive: `EmbeddingInput.image`/`.audio`, `EmbeddingModality`,
+`EncodedMediaFormat`, `sniffEncodedMediaFormat`, `EmbeddingModel.modalities`,
+`maxInputTokens` and the `EmbeddingException` family
+(`EmbeddingLoadException`, `EmbeddingEngineException`, …).
+
+Test fakes and mocks: `EmbeddingModel` is an `abstract base class` now. A fake
+is `final class FakeEmbedder extends EmbeddingModel` (add `with CloseNotifier`
+from `package:flutter_edge_ai/engine.dart` for close listeners) implementing
+`dimension`, `isClosed`, `embed`, `addCloseListener` and `close`.
+`implements EmbeddingModel`, and therefore a mockito or mocktail mock of it, no
+longer compiles, and `isClosed` is no longer defaulted.
+
+### EmbeddingGemma 2
+
+`flutter_edge_ai_litertlm` 1.13.0 runs EmbeddingGemma 2 text: one `.litertlm`
+file that carries its own tokenizer, so it installs without
+`tokenizerFrom…()` and needs no `flutter_edge_ai_embeddings`. Natively
+(Android, iOS, macOS, Linux, Windows) on CPU, at most 1024 input tokens — keep
+chunks at 512 or fewer. litertlm 1.13.1 adds images (the 440m and 740m
+bundles), audio (the 740m), the web on WebGPU (text and images; audio and
+combined inputs from 1.13.2) and Qualcomm NPUs (per-SoC bundles, Android and
+Linux arm64); 1.13.2 adds the Intel Panther Lake NPU on Windows. See
+the [litertlm README](https://pub.dev/packages/flutter_edge_ai_litertlm) for
+the install snippet and its disk and memory cost.
+
+### Web: copy the new `litert_embeddings.js`
+
+The LiteRT.js embedding bundle changed its API. Copy `web/litert_embeddings.js`
+from `flutter_edge_ai_litertlm` 1.13.0 (with the three files next to it) into
+your app's `web/`. A stale copy fails `getActiveEmbedder()` with an
+`EmbeddingLoadException` that names the file. Web EmbeddingGemma 1 now gets
+the same task prefix and the same token ids as native for every `TaskType`.
+From litertlm 1.13.1 an EmbeddingGemma 2 `.litertlm` embedder runs on web too,
+on WebGPU: add `window.EmbeddingEngine = m.EmbeddingEngine;` to the
+`@litert-lm/core` script in `web/index.html` (see the litertlm README's web
+setup).
+
+### Imports: `flutter_edge_ai.dart` for apps, `engine.dart` for engines
+
+Core's internals moved under `lib/src`, which is private. The public
+libraries are `flutter_edge_ai.dart` (apps), `engine.dart` (engine and
+tokenizer packages; it re-exports the app library), `engine_io.dart`,
+`engine_web.dart` and `genai.dart`.
+
+| Before | After |
+|---|---|
+| `package:flutter_edge_ai/core/…`, `/mobile/…`, `/web/…`, `/desktop/…`, `/flutter_edge_ai_interface.dart`, `/model_file_manager_interface.dart` | `package:flutter_edge_ai/flutter_edge_ai.dart`; engine packages `package:flutter_edge_ai/engine.dart` |
+| `EmbeddingTokenizerRegistry`, `SkillExecutorRegistry`, `ForwardResult`, `EmbeddingOutputContract`, `EmbeddingTokenizer`, `TokenizedInput`, `EmbeddingTokenizerFactory`, `meanPoolAndNormalize` from the app library | from `package:flutter_edge_ai/engine.dart` |
+| `ModelThinkingFilter` through `package:flutter_edge_ai/core/extensions.dart` | the app library |
+| `EmbeddingForwardPass`, `ForwardPassDescriptor`, `EmbeddingForwardPassFactory`, `CommonEmbeddingModel.create`, `EmbeddingBackendProvider.createModel` | `EmbeddingPass`, `EmbeddingPassInfo`, `EmbeddingPassDescriptor<C>`, `TokenEmbeddingPass` (if you tokenize in Dart) and `EmbeddingBackendProvider.describe()`, which returns `EmbeddingPassDescriptor(engineTag:, factory:, config:, activeBackend:)`. Core builds, hosts and closes the model. |
+| `CommonEmbeddingModel.inputSequenceLength`, `.outputDimension` | `EmbeddingModel.maxInputTokens`, `.dimension` |
+| `class MyBackend implements EmbeddingBackendProvider` | `final class MyBackend extends EmbeddingBackendProvider` (an `abstract base class`) |
+| `flutter_edge_ai_embeddings` re-exported core's seam types | it exports only `GemmaEmbeddingTokenizers`; import the seam types from `engine.dart`. A SigLIP input over 63 tokens throws instead of truncating. |
+| onnx `OnnxEmbeddingForwardPass` | `OnnxEmbeddingPass` with `OnnxEmbeddingConfig`; it extends `TokenEmbeddingPass` |
+| litertlm `WebEmbeddingModel` (`web_embedding_model.dart`) | removed: `FlutterEdgeAi.getActiveEmbedder()` |
+
+### Removed deprecated members
+
+| Removed | Use |
+|---|---|
+| `FlutterEdgeAi.initialize(enableWebCache:)` | `webStorageMode:` |
+| `ModelFileManager.ensureModelReady(filename, url)` | `ensureModelReadyFromSpec(spec)` |
+| `installModelFromAsset`, `installModelFromAssetWithProgress` | `FlutterEdgeAi.installModel(…).fromAsset(path)`, with `.withProgress(…)` |
+| `setModelPath` | `FlutterEdgeAi.installModel(…).fromFile(path)` |
+| `setLoraWeightsPath` | `FlutterEdgeAi.installModel(…).withLoraFromFile(path)` |
+| `deleteLoraWeights` | install the model again without LoRA |
+| `deleteCurrentModel` | `deleteModel(spec)` |
+| `FunctionCallParser.isJsonStart`, `isJsonComplete` | `isFunctionCallStart`, `isFunctionCallComplete(buffer, modelType: …)` |
+| `StopTokenFilter` | nothing: stop tokens have not reached the output since 0.14.0 |
+| `FileSystemService.getTargetPath` | `getReadTargetPath` or `getWriteTargetPath` |
+| `InferenceModelSpec.modelUrl`, `loraUrl` | `modelSource`, `loraSource` |
+| `EmbeddingModelSpec.modelUrl`, `tokenizerUrl` | `modelSource`, `tokenizerSource` |
+| `EmbeddingModelSpec.fromLegacyUrl` | `EmbeddingModelSpec(name: …, modelSource: ModelSource.network(url), tokenizerSource: ModelSource.network(tokenizerUrl))` |
+| `MobileModelManager`/`WebModelManager.currentActiveModel`, `SmartDownloader.isHuggingFaceUrl` | these classes are internal now; read `FlutterEdgeAi.activeModelSpec` / `activeEmbedderSpec` |
+
+`InferenceModelSpec.fromLegacyUrl` was deprecated here and removed in 2.5.0. Build
+the spec with the `ModelSource` that matches the URL:
+`ModelSource.network(url)` for `http(s)://`, `ModelSource.asset(path)` for
+`asset://` or a bare path, `ModelSource.bundled(name)` for `native://`,
+`ModelSource.file(path)` for `file://`. The factory defaulted to
+`modelType: ModelType.general`; pass that to keep its behaviour.
+
+### RAG: `flutter_edge_ai_rag` 1.1, `flutter_edge_ai_sqlite` and `flutter_edge_ai_qdrant` 2.1
+
+A location now binds one embedding profile **and** one document modality
+(`VectorStoreSpec.documents`: text, image or audio).
+
+| rag 1.0 | rag 1.1 |
+|---|---|
+| `open(spec:, activeEmbedderProfileId: id)`, profile bound on the first text operation | `open(spec:, embedder: FlutterEdgeAiActiveEmbedder(profileId: id))` — or `.forActiveModel(namespace:)` — resolves the profile (loading the model) and binds the location at once: install the embedder before `open()` |
+| `open(spec:, embeddingProfile: p)` for precomputed vectors | `openVectors(spec:, profile: p)` |
+| `index.addText(id:, content: c)` | `index.add(id:, document: EmbeddingInput.text(c))` |
+| `index.searchText(query: q)` | `index.search(query: EmbeddingInput.text(q))` |
+| `index.embeddingProfile` could be null | never null; `index.documents` names the modality |
+| `RagEmbedder { profile, embedDocument(String), embedQuery(String) }` | `{ resolveProfile(), modalities, embedDocument(EmbeddingInput), embedQuery(EmbeddingInput, documentModality:) }`: wrap strings in `EmbeddingInput.text`, return `{EmbeddingModality.text}` from `modalities` |
+| a filter on an undeclared field was ignored | `ArgumentError`: declare every filtered field in `VectorStoreSpec.filterSchema` |
+| `VectorStoreRepository` (`implements`) with `readEmbeddingProfile`/`bindEmbeddingProfile` | `abstract base class` (`extends`) with `readBinding()`/`bind(VectorStoreBinding)`; the [rag README](https://pub.dev/packages/flutter_edge_ai_rag) describes how a store persists the binding |
+| `EmbeddingProfile` ids could contain control characters | U+0000–U+001F are refused, and `EmbeddingProfile` can no longer be implemented |
+
+`flutter_edge_ai_rag` re-exports `EmbeddingInput`, `EmbeddingModality`,
+`TaskType` and the `EmbeddingException` family, and every error of a
+`Future`-returning `RagIndex` or `FlutterEdgeAiRag` method arrives as a failed
+future.
+
+Stores written by sqlite/qdrant 2.0.x open unchanged in 2.1.0 as text
+locations, and text locations move both ways. A location bound to images or
+audio cannot be opened by sqlite/qdrant 2.0.x.
+
+## flutter_edge_ai 2.2.0: sampling defaults come from the model
+
+`createSession`, `openSession`, `createChat` and `openChat` no longer default to
+`temperature: 0.8, randomSeed: 1, topK: 1`, which was greedy decoding for every
+model. The four parameters are nullable, and an unset one comes from:
+
+1. the sampler the model file ships — a native `.litertlm` bundle's, or an
+   ONNX model's `genai_config.json`;
+2. the defaults its family publishes, `SamplingParams.forModelType` (Gemma:
+   `temperature: 1.0, topK: 64, topP: 0.95`);
+3. `temperature: 0.8, topK: 40, topP: 0.95, randomSeed: 1`.
+
+Output that was greedy is now sampled on LiteRT-LM and MediaPipe, except for
+the families whose publishers decode greedily (Phi, Hammer). ONNX leaves unset
+values to the model's config, on web too, where it used to decode greedily
+whatever the config said; built-in AI keeps `temperature: 0.8, topK: 1`. Pass
+`topK: 1` or `temperature: 0` to keep it greedy. Values you pass now also reach
+ONNX and web `.litertlm`, which used to drop them, and a value no engine can
+sample with (a negative temperature,
+`topK` below 1, `topP` outside (0, 1]) throws an `ArgumentError`. `.litertlm`
+keeps the sampler of an engine's first generation for every later conversation
+(google-ai-edge/LiteRT-LM#2080): close and reload the model to change it.
+`genkit_flutter_edge_ai` 0.8.1 and `flutter_edge_ai_agent` 0.2.8 pass unset
+values through the same way. What each engine reads, and what it ignores, is
+under [Sampling](https://flutteredge.ai/docs/getting-started#sampling).
+
+Upgrade every `flutter_edge_ai_*` package together (`flutter pub upgrade`, not
+`flutter pub upgrade flutter_edge_ai` alone): earlier engine releases override
+the old signature and do not compile against core 2.2.0.
+
+If you implement `InferenceModel` yourself, declare the parameters as
+`double? temperature, int? randomSeed, int? topK, double? topP` and fill unset
+ones with `SamplingParams.resolve`.
+
+## flutter_edge_ai 2.1.0: `isThinking` is `enableThinking`
+
+A rename with no `dart fix` rule, so the compiler finds every call site:
+
+- `createSession`, `openSession`, `createChat` and `openChat` take
+  `enableThinking:` instead of `isThinking:`.
+- `ModelRuntimeDefaults.isThinking` is `thinkingDeclared` — what the model's
+  manifest declares, which you pass on as
+  `enableThinking: r.runtime.thinkingDeclared ?? false`.
+- `genkit_flutter_edge_ai` 0.7: the `isThinking` model option is
+  `enableThinking`.
+
+Requires `flutter_edge_ai_litertlm` 1.9.0 or later, which sends the flag to the
+runtime under the key chat templates read.
+
+## flutter_edge_ai_litertlm 1.10.0: Android NPU is opt-in
+
+Only apps that use `PreferredBackend.npu` on Android need to act. Qualcomm
+licenses its QNN runtime for redistribution inside an application only, so the
+package no longer ships it and every other Android app is about 83 MB smaller
+on the device. An app that wants the Qualcomm NPU asks for it:
+
+```yaml
+hooks:
+  user_defines:
+    flutter_edge_ai_litertlm:
+      qualcomm_npu: true
+```
+
+- Put it in the pubspec of the app you build, or in the workspace root's
+  pubspec if the app is a pub workspace member; pub reads `user_defines` from
+  nowhere else, and the runtime log then says the stack is not enabled.
+- The build hook downloads `com.qualcomm.qti:qnn-runtime` from Maven Central
+  once per machine and caches it. Offline builds and CI without Maven access set
+  `qualcomm_npu_maven_url` to a mirror or `qualcomm_npu_aar` to the AAR itself.
+- Setting the flag accepts Qualcomm's AI Stack License. Qualcomm's notices are
+  in the package's `NOTICES` and reach your app's licence page on their own.
+- Requires `flutter_edge_ai` 2.1.1: core prepares the libraries the NPU
+  dispatch loads, now from split APKs as well and off the main thread.
+
+Without the flag a generic bundle still loads: `npu` falls back to GPU, then
+CPU, as on any device without an NPU. A bundle compiled for an NPU cannot run
+anywhere else, so from litertlm 1.14.0 its load fails instead, with a
+`BackendInitException` whose one attempt says the stack is not enabled.
+
+**Linux arm64 (`flutter_edge_ai_litertlm` 1.11.0).** The same flag also bundles
+the Qualcomm NPU stack into Linux arm64 builds — Qualcomm Linux boards such as
+the QCS6490, QCS8275 or QCS9075. The hook reads the QNN runtime out of
+Qualcomm's public QAIRT SDK zip (about 32 MB of it, by range request);
+`qualcomm_npu_qairt_zip` points it at a local copy. On the board the user must
+be in group `fastrpc`. A Linux x64 build ignores the flag.
+
+## Flutter Edge AI 1.x → 2.0: RAG leaves core
+
+Flutter Edge AI 2.0 keeps inference, embeddings, speech, installation, and
+model lifecycle in `flutter_edge_ai`, but moves RAG orchestration and all
+vector-store contracts to `flutter_edge_ai_rag`. RAG is now instance-scoped and
+can run with the active core embedder, a custom embedder, or precomputed vectors
+without initializing core. The snippets below use the current RAG API
+(`flutter_edge_ai_rag` 1.1, see the 2.3.0 section above).
+
+Update dependencies:
+
+```yaml
+dependencies:
+  flutter_edge_ai: ^2.3.0
+  flutter_edge_ai_rag: ^1.1.0
+  flutter_edge_ai_sqlite: ^2.1.0 # or flutter_edge_ai_qdrant: ^2.1.0
+```
+
+Remove `vectorStore:` and `filterSchema:` from `FlutterEdgeAi.initialize()`.
+Register only AI runtimes there:
+
+```dart
+await FlutterEdgeAi.initialize(
+  inferenceEngines: const [LiteRtLmEngine()],
+  embeddingBackends: const [LiteRtEmbeddingBackend()],
+  embeddingTokenizers: const [GemmaEmbeddingTokenizers()],
+);
+```
+
+Then create and own the RAG index independently:
+
+```dart
+import 'package:flutter_edge_ai_rag/flutter_edge_ai_rag.dart';
+import 'package:flutter_edge_ai_sqlite/flutter_edge_ai_sqlite.dart';
+
+final rag = FlutterEdgeAiRag(
+  providers: const [SqliteVectorStoreProvider()],
+);
+final index = await rag.open(
+  spec: VectorStoreSpec(
+    providerId: SqliteVectorStoreProvider.providerId,
+    location: databasePath,
+    filterSchema: FilterSchema(fields: [
+      FilterField(name: 'category', type: FilterFieldType.string),
+    ]),
+  ),
+  embedder: FlutterEdgeAiActiveEmbedder(
+    profileId: 'embeddinggemma-300m-seq256-mp-rev-29888fcee321-'
+        'retrieval-prefix-meanpool-l2-v1',
+  ),
+);
+
+try {
+  await index.add(id: 'doc-1', document: EmbeddingInput.text('Text to retrieve'));
+  final hits = await index.search(
+    query: EmbeddingInput.text('What should I retrieve?'),
+  );
+  await index.flush();
+  print(hits);
+} finally {
+  await index.dispose();
+}
+```
+
+The old and new calls map as follows:
+
+| 1.x core RAG | `RagIndex` |
+|---|---|
+| `FlutterEdgeAi.rag.initialize(location)` | `FlutterEdgeAiRag(...).open(spec: VectorStoreSpec(location: ...), embedder: ...)` |
+| `addDocument(...)` | `add(id: ..., document: EmbeddingInput.text(...))` |
+| `addDocumentWithEmbedding(...)` | `addVector(...)` |
+| `searchSimilar(query: ...)` | `search(query: EmbeddingInput.text(...))` |
+| low-level vector search | `searchVector(embedding: ...)` |
+| `removeDocument(id: ...)` | `remove(id: ...)` |
+| `stats()` / `flush()` / `clear()` | same methods on the owned index |
+| core/plugin teardown | `RagIndex.dispose()` before core/embedder teardown |
+
+Also breaking in 2.0:
+
+- `Filter`, `FilterSchema`, `RetrievalResult` and `VectorStoreRepository` now
+  import from `package:flutter_edge_ai_rag/flutter_edge_ai_rag.dart`.
+- `ModelFileManager.setActiveModel` is removed; use `ensureModelReadyFromSpec`.
+- The flutter_gemma-era name aliases (`FlutterGemma`, …) are gone;
+  `dart fix --apply` still renames them.
+
+### Embedding-profile migration
+
+Every persistent location is now durably bound to an `EmbeddingProfile`. Its
+ID must version the weights, tokenizer, pooling, normalization, and
+document/query prefix contract; a path or mutable download URL is not a stable
+identity. Use a different location after any of those inputs change.
+
+For precomputed vectors, open a vector-only index with the profile of the
+pipeline that produced them:
+
+```dart
+final index = await rag.openVectors(
+  spec: VectorStoreSpec(
+    providerId: SqliteVectorStoreProvider.providerId,
+    location: databasePath,
+  ),
+  profile: EmbeddingProfile(
+    id: embeddingProfileId,
+    dimension: 768,
+  ),
+);
+```
+
+A new store cannot infer which embedding space raw numbers belong to, so the
+profile is required. If later searches embed text with the active core
+embedder, open with `embedder: FlutterEdgeAiActiveEmbedder(profileId:
+embeddingProfileId)` instead — `addVector` and `searchVector` work on that index
+too. For independent text RAG, pass a custom `RagEmbedder` whose
+`resolveProfile()` reports the same stable identity.
+
+A nonempty 1.11 store has no profile metadata. The safest migration is a new,
+profile-versioned location plus re-indexing. If you can independently attest
+the exact old model and preprocessing, open once with
+`VectorStoreSpec(…, allowLegacyProfileAdoption: true)` and the verified
+`EmbeddingProfile` passed as `profile:` to `rag.openVectors`; the provider
+checks the stored vector dimension before persisting the binding.
+
+SQLite filter schemas are part of the physical `vec0` table. Adding or changing
+a field requires a new schema-versioned location and re-indexing. Do not open a
+database first without a schema and later expect `vec0` to alter it.
+
+On Web, one location may have only one live SQLite index because the provider
+holds an exclusive Web Lock. Keep one app-owned `RagIndex`, make its open future
+single-flight, and dispose it before reopening the location. Dispose all RAG
+indexes before `FlutterEdgeAi.dispose()` or before disposing a custom embedder.
+
+## Historical: flutter_gemma → flutter_edge_ai (1.11.4)
+
+The project is now **Flutter Edge AI**. Every package moved to a new name; the
+code, the platforms and the on-device data are the same.
+
+| Before | After |
+|--------|-------|
+| `flutter_gemma` | `flutter_edge_ai` 1.11.4 |
+| `flutter_gemma_litertlm` | `flutter_edge_ai_litertlm` 1.8.6 |
+| `flutter_gemma_mediapipe` | `flutter_edge_ai_mediapipe` 1.0.8 |
+| `flutter_gemma_embeddings` | `flutter_edge_ai_embeddings` 2.2.1 |
+| `flutter_gemma_rag_sqlite` | `flutter_edge_ai_sqlite` 1.4.0 |
+| `flutter_gemma_rag_qdrant` | `flutter_edge_ai_qdrant` 1.3.2 |
+| `flutter_gemma_speech` | `flutter_edge_ai_speech` 0.5.2 |
+| `flutter_gemma_agent` | `flutter_edge_ai_agent` 0.2.6 |
+| `flutter_gemma_builtin_ai` | `flutter_edge_ai_builtin_ai` 0.3.0 |
+| `flutter_gemma_onnx` | `flutter_edge_ai_onnx` 0.5.1 |
+| `flutter_gemma_diagnostics` | `flutter_edge_ai_diagnostics` 0.1.0 |
+| `genkit_flutter_gemma` | `genkit_flutter_edge_ai` 0.6.2 |
+
+The old `flutter_gemma*` packages stay on pub.dev as they are, so an app that
+has not moved yet keeps working.
+
+To move:
+
+1. Replace each `flutter_gemma*` dependency in `pubspec.yaml` with its new name
+   and the version from the table.
+2. In your import lines replace `flutter_gemma` with `flutter_edge_ai`
+   everywhere it appears — the package and the file name, e.g.
+   `package:flutter_gemma/flutter_gemma.dart` →
+   `package:flutter_edge_ai/flutter_edge_ai.dart`. Two packages also drop
+   `rag_`: `flutter_gemma_rag_sqlite` → `flutter_edge_ai_sqlite` and
+   `flutter_gemma_rag_qdrant` → `flutter_edge_ai_qdrant`.
+3. Run `dart fix --apply` (Flutter 3.44 or newer). It renames `FlutterGemma`,
+   `FlutterGemmaPlugin`, `FlutterGemmaDesktop`, `GemmaLogLevel`,
+   `FlutterGemmaDiagnostics` and the genkit names to their new spellings. In 1.11.4
+   they still compiled as deprecated aliases; `flutter_edge_ai` 2.0.0,
+   `flutter_edge_ai_diagnostics` 0.2.0 and `genkit_flutter_edge_ai` 0.7.0 drop
+   the aliases, and `dart fix --apply` renames the old names all the same.
+
+If you installed the agent skills, run `dart run skills@ get --all` again
+and delete the old `flutter-gemma-*` skill directories: they still teach the
+old names.
+
+What did not change in the 1.11.4 rename itself:
+
+- Installed models, the model directory and the Web cache stay where they are,
+  so nothing downloads again.
+- Existing Qdrant and SQLite vector stores opened as before in 1.11.4. Moving
+  onward to 2.0 requires the embedding-profile migration above.
+- The Android package `dev.flutterberlin.*`, the platform channels and the
+  macOS `post_install` snippet in your Podfile are unchanged.
+
+Genkit: model and embedder ids are now `flutter-edge-ai/<name>`, and the
+context-window middleware is registered as `flutter-edge-ai-context-window`.
+Code that uses `flutterEdgeAi.model(...)` and `trimContext()` picks this up; a
+hard-coded `'flutter-gemma/<name>'` string has to change. The old Dart names were
+deprecated aliases in 0.6.2; 0.7.0 drops them, and `dart fix --apply` renames them.
+
+Move every package at once: an app that keeps a `flutter_gemma_X` next to
+`flutter_edge_ai_X` gets the same native libraries and Android classes twice,
+and the build fails. An old satellite you did not move (say
+`flutter_gemma_speech`) pulls the old engine back in the same way.
+
+`flutter_edge_ai_sqlite` needs Flutter 3.47. An app on Flutter 3.44 that uses
+the SQLite store upgrades Flutter first.
+
+## Historical: flutter_gemma 0.x → 1.0
+
+1.0 split the monolithic `flutter_gemma` plugin into a small **core** package
+plus **opt-in** packages, so your app only ships the native weight it actually
+uses. This is the **only breaking change**: you add the packages you need and one
+`initialize(...)` call. The model/session/chat/embedding APIs stayed compatible
+in that release; RAG later changed in 2.0 as documented above.
+
+## TL;DR
+
+1. Add the opt-in packages for the formats/features you use (see table below).
+2. Call `await FlutterEdgeAi.initialize(inferenceEngines: [...], ...)` once in `main()`,
+   passing the engines/backends from the packages you added.
+3. Everything else stays the same.
+
+## 1. pubspec.yaml
+
+**Before (0.16.x):**
+```yaml
+dependencies:
+  flutter_gemma: ^0.16.3
+```
+
+**Current equivalents (2.5):**
+```yaml
+dependencies:
+  flutter_edge_ai: ^2.5.5                 # core — always required
+  flutter_edge_ai_litertlm: ^1.19.2       # .litertlm + LiteRtEmbeddingBackend
+  flutter_edge_ai_mediapipe: ^1.2.6       # .task / .bin
+  flutter_edge_ai_embeddings: ^2.3.2      # tokenizer providers
+  flutter_edge_ai_rag: ^1.1.2             # RAG orchestration + contracts
+  flutter_edge_ai_qdrant: ^2.1.1          # native qdrant provider
+  flutter_edge_ai_sqlite: ^2.1.1          # sqlite-vec provider; needs Flutter 3.47
+```
+
+Pick by what you actually used in 0.16.x:
+
+| In 0.16.x you used… | Add now |
+|---|---|
+| `.litertlm` models (Gemma 4, Qwen3, FastVLM, any desktop) | `flutter_edge_ai_litertlm` |
+| `.task` / `.bin` models (Gemma3n, Gemma 3, DeepSeek, Qwen 2.5, Phi-4, …) | `flutter_edge_ai_mediapipe` |
+| `generateEmbedding()` / `installEmbedder()` | `flutter_edge_ai_litertlm` + `flutter_edge_ai_embeddings` (tokenizers, required since 1.9; see [Embedder decoupling](#embedder-decoupling-litertlm-150) below). `generateEmbedding` is `embed` since 2.3.0 |
+| RAG on native | `flutter_edge_ai_rag` + `flutter_edge_ai_qdrant` |
+| RAG on web | `flutter_edge_ai_rag` + `flutter_edge_ai_sqlite` |
+
+> Not sure which format your models are? Desktop runs `.litertlm`
+> (`flutter_edge_ai_litertlm`), ONNX, GGUF (`flutter_edge_ai_llama`) or
+> built-in AI — no MediaPipe. On
+> mobile/web check the file extension you install.
+> You can add **both** engine packages and let the registry route each model by
+> its file type.
+
+> **New opt-in packages since 1.2/1.3** (not migration targets from the 0.16.x
+> monolith — they add new capabilities): `flutter_edge_ai_agent` (on-device agent
+> skills — SKILL.md + tool-calling loop), `flutter_edge_ai_builtin_ai` (OS
+> system models — Gemini Nano on Android and Web, Apple Foundation Models on
+> iOS/macOS, Windows AI Foundry on Windows; a thin adapter over
+> `flutter_local_ai`, which owns the native layer), `flutter_edge_ai_onnx` (ONNX
+> Runtime generation and embeddings), `flutter_edge_ai_llama` (GGUF models
+> through llama.cpp) and `flutter_edge_ai_diagnostics` (memory a model costs,
+> read from the OS).
+> Add any of them only if you want that feature — see the README **Features** list.
+
+## 2. main.dart — the one new call
+
+**Before (0.16.x):** engines were bundled into core; `initialize()` was optional.
+```dart
+void main() {
+  WidgetsFlutterBinding.ensureInitialized();
+  // (initialize was optional — only for HF token / retries)
+  runApp(MyApp());
+}
+```
+
+**After (1.0):** register the packages you added.
+```dart
+import 'package:flutter_edge_ai/flutter_edge_ai.dart';
+import 'package:flutter_edge_ai_embeddings/flutter_edge_ai_embeddings.dart';
+import 'package:flutter_edge_ai_litertlm/flutter_edge_ai_litertlm.dart';
+import 'package:flutter_edge_ai_mediapipe/flutter_edge_ai_mediapipe.dart';
+
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+
+  await FlutterEdgeAi.initialize(
+    inferenceEngines: const [LiteRtLmEngine(), MediaPipeEngine()],
+    embeddingBackends: const [LiteRtEmbeddingBackend()],
+    embeddingTokenizers: const [GemmaEmbeddingTokenizers()],
+    // '' when the define is absent, and an empty token still sends a
+    // bare `Authorization: Bearer` header — pass null instead.
+    huggingFaceToken: const String.fromEnvironment('HUGGINGFACE_TOKEN').isNotEmpty
+        ? const String.fromEnvironment('HUGGINGFACE_TOKEN')
+        : null,
+  );
+
+  runApp(MyApp());
+}
+```
+
+Only list the AI runtimes you ship. RAG storage is registered independently on
+`FlutterEdgeAiRag`, not on core.
+
+## 3. Everything else is unchanged
+
+These kept the same API through the 1.0 split — no edits needed for it (later
+breaking changes, such as `isThinking` → `enableThinking` in 2.1.0, RAG
+moving to `flutter_edge_ai_rag` in 2.0 and the embedding API of 2.3.0, are
+covered above):
+
+```dart
+// install + run a model
+await FlutterEdgeAi.installModel(
+        modelType: ModelType.gemma4, fileType: ModelFileType.litertlm)
+    .fromNetwork(url, token: token).install();
+final model = await FlutterEdgeAi.getActiveModel(maxTokens: 2048);
+final chat  = await model.createChat();
+await chat.addQueryChunk(Message.text(text: 'Hello', isUser: true));
+await for (final r in chat.generateChatResponseAsync()) { /* r is a ModelResponse */ }
+
+// embeddings
+await FlutterEdgeAi.installEmbedder()
+    .modelFromNetwork(modelUrl, token: token)
+    .tokenizerFromNetwork(tokenizerUrl, token: token)
+    .install();
+
+// RAG: use the independently owned RagIndex shown in the 2.0 section above.
+```
+
+## What you'll see if you forget step 2
+
+- Calling `getActiveModel()` with no matching `inferenceEngines` registered throws
+  a `StateError` naming the model's `ModelFileType` and the engines that are
+  registered — add the engine package for that file type.
+- `FlutterEdgeAi.getActiveEmbedder()` with no `embeddingBackends` throws
+  a clear "add an embedding backend package" error (e.g. `flutter_edge_ai_litertlm`'s
+  `LiteRtEmbeddingBackend`).
+- `FlutterEdgeAiRag.open()` with no matching provider throws and reports the
+  registered provider IDs.
+
+## Platform setup
+
+Native setup moved to the package that owns it:
+
+- **MediaPipe Gradle / Pod deps + the `@mediapipe/tasks-genai` web CDN** are now in
+  `flutter_edge_ai_mediapipe` (bundled automatically on Android/iOS; add the CDN
+  `<script>` for web — see the main README).
+- **The `.litertlm` native library + the `@litert-lm/core` web CDN** are in
+  `flutter_edge_ai_litertlm`.
+- **The custom `sqlite3.wasm` (with `sqlite-vec`/`vec0` linked in)** ships as a web asset in `flutter_edge_ai_sqlite`.
+
+The iOS/Android entitlements and manifest entries from the main README still
+apply when you ship an inference engine. See the
+[README platform setup](README.md#platform-setup) for the full list.
+
+## Embedder decoupling (litertlm 1.5.0)
+
+If you were on an earlier 1.x and imported `LiteRtEmbeddingBackend` from
+`flutter_gemma_embeddings`, that class moved:
+
+**Before:**
+```dart
+import 'package:flutter_gemma_embeddings/flutter_gemma_embeddings.dart';
+```
+
+**After:**
+```dart
+import 'package:flutter_edge_ai_litertlm/flutter_edge_ai_litertlm.dart';
+```
+
+`LiteRtEmbeddingBackend()` itself is unchanged — only the import path moved,
+and there is no re-export shim, so it must be updated.
+
+### Register a tokenizer (litertlm 1.8.0 / onnx 0.4.0)
+
+An embedding backend no longer names a tokenizer. Which family a model needs
+is a property of the MODEL, not of the engine that runs it — EmbeddingGemma is
+SentencePiece whether LiteRT or ONNX Runtime executes its weights — so the app
+supplies it, and the engine packages stopped depending on
+`flutter_gemma_embeddings` because of it.
+
+**Add the dependency** (it no longer arrives through the engine):
+```yaml
+dependencies:
+  flutter_edge_ai_embeddings: ^2.3.0
+```
+
+**Add one line to `initialize`:**
+```dart
+await FlutterEdgeAi.initialize(
+  embeddingBackends: [LiteRtEmbeddingBackend()],
+  embeddingTokenizers: [GemmaEmbeddingTokenizers()],   // new
+);
+```
+
+Omit it and `getActiveEmbedder()` fails with an `EmbeddingLoadException`
+(its `cause` a `StateError`) naming this step. It
+never falls back to a tokenizer of its own choosing: the wrong family produces
+vectors that are quietly the wrong point in the embedding space, which no test
+downstream can tell from a working model.
+
+An app that never embeds anything passes neither list and can drop
+`flutter_edge_ai_embeddings` entirely.
+
+If your app used embeddings **without** also using `.litertlm` inference, add
+`flutter_edge_ai_litertlm` to your `pubspec.yaml` — this also delivers the
+shared native bundle (`libLiteRtLm`) your app was previously getting
+transitively through `flutter_gemma_embeddings`'s old dependency on it.
+
+## Troubleshooting
+
+- **`dlopen` "library not found" after removing a package:** if you had both
+  `flutter_edge_ai_litertlm` and `flutter_edge_ai_speech` and removed one, run
+  `flutter clean` and delete `~/Library/Caches/flutter_gemma/native` (Windows:
+  `%LOCALAPPDATA%\flutter_gemma\native`), then `flutter pub get`. They share one
+  native library (`flutter_edge_ai_embeddings` 2.x has no native code); see
+  those packages' READMEs.

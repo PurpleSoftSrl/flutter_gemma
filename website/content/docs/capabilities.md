@@ -1,0 +1,154 @@
+---
+title: Capabilities
+description: Which runtime gives you text generation, embeddings and speech on each platform, what each engine supports, and how to check support at runtime.
+meta:
+  - property: og:image
+    content: https://flutteredge.ai/images/og-image.png
+---
+
+Flutter Edge AI is modular: core runs nothing on its own, and each runtime you
+add brings its own capabilities. This page shows what you can swap for what.
+
+## What each runtime provides
+
+| | LiteRT | ONNX Runtime | MediaPipe | Built-in AI |
+|---|---|---|---|---|
+| **Text generation** | ✅ All | ✅ All | ✅ Mobile + Web | ✅ All but Linux |
+| **Embeddings** | ✅ All | ✅ All | — | — |
+| **Speech-to-text** | ✅ Native | — | — | — |
+| **Text-to-speech** | ✅ Native | — | — | — |
+
+All means Android, iOS, macOS, Windows, Linux and Web; Native means all of
+them except Web; Mobile means Android and iOS. On the Web, LiteRT-LM text
+generation runs only dedicated `-web.litertlm` exports (Gemma 4 and Gemma 3n
+today). MediaPipe's LLM Inference API is maintenance-only upstream, so new apps
+should use LiteRT-LM (`.litertlm`). The packages are
+`flutter_edge_ai_litertlm` (plus `flutter_edge_ai_speech` for speech),
+`flutter_edge_ai_onnx`, `flutter_edge_ai_mediapipe` and
+`flutter_edge_ai_builtin_ai`.
+
+So text generation has five interchangeable runtimes (the fifth is llama.cpp through `flutter_edge_ai_llama`, for GGUF models, with image and audio input through a compatible GGUF projector; see [llama.cpp](/docs/llama)), embeddings have three
+(LiteRT and ONNX on every platform, and llama.cpp for EmbeddingGemma 2 GGUF text
+natively through `flutter_edge_ai_llama` 0.0.3, measured on macOS, Linux and
+Windows; Android and iOS not qualified), and speech has one (LiteRT, on
+native platforms).
+
+- **Embeddings**: LiteRT runs `.tflite` models (EmbeddingGemma 1, Gecko) and
+  EmbeddingGemma 2 `.litertlm` bundles — text, and JPEG/PNG/GIF/BMP images
+  with the 440m and 740m bundles, on native platforms and (since litertlm
+  1.13.1, on WebGPU) on the Web; WAV/MP3/FLAC audio with the 740m bundle and
+  several parts in one vector, on native platforms (litertlm 1.13.1) and on
+  the Web (1.13.2, WebGPU); ONNX runs `.onnx`
+  models (MiniLM, EmbeddingGemma). The `.tflite` and `.onnx` models take their
+  tokenizer from `flutter_edge_ai_embeddings`; an EmbeddingGemma 2 bundle
+  carries its own. On the Web, ONNX embeddings accept WordPiece (BERT-style)
+  models only. Every embedding model takes all nine `TaskType`s.
+- **Speech**: speech-to-text runs moonshine, Whisper and Parakeet on a finished
+  recording (it does not stream); text-to-speech runs Matcha, Qwen3-TTS and
+  Inflect. `VoiceSession` combines the two into a voice loop.
+- **Built-in AI** uses the model the OS ships: Gemini Nano on Android, Apple
+  Foundation Models on iOS and macOS 26+, Phi Silica on Windows, and the Chrome
+  Prompt API on the Web.
+- Native libraries are built for arm64 on Android, iOS and macOS, for x64 on
+  Windows, and for x64 and arm64 on Linux (ONNX Runtime: Linux x64 only).
+
+## What each engine supports for text generation
+
+| | LiteRT-LM | MediaPipe | ONNX | Built-in AI |
+|---|---|---|---|---|
+| **Vision** | ✅ Native | ✅ | — | ✅ Android |
+| **Audio** | ✅ Native | — | — | — |
+| **Function calling** | ✅ Native/Prompt | ✅ Prompt | ✅ Prompt | ✅ Prompt |
+| **Thinking** | ✅ Full | ✅ Tags | ✅ Tags | — |
+| **Structured output (`responseFormat`)** | ✅ qualified native CPU/GPU rows | ❌ refused | ✅ native macOS arm64 only | ❌ no qualified platform yet |
+
+`flutter_edge_ai_llama` also supports response formats on macOS arm64 CPU/Metal
+and in Chrome on macOS with dart2wasm + WebGPU; other GGUF hosts/backends are
+refused until qualified. ONNX requires native macOS arm64 and a model directory
+containing `tokenizer.json`; ONNX Web refuses formats. LiteRT-LM currently
+enforces the whole dialect on macOS and iOS arm64 CPU/Metal, Linux x64
+CPU/Vulkan, Windows x64 CPU/D3D12, and Android arm64 CPU plus
+Adreno/Mali/PowerVR GPU. NPU, Web, and every unlisted row are refused.
+
+- **Function calling.** *Native*: the engine hands the tools to the runtime.
+  LiteRT-LM does this for Gemma 4 and FunctionGemma, and on native platforms
+  also constrains decoding to the call format; other models on LiteRT-LM use
+  the prompt path. *Prompt*: `InferenceChat` describes the tools in the prompt
+  and parses the call out of the reply, so it works with any model that follows
+  the format.
+- **Gemma 4 function calling** needs LiteRT-LM (`.litertlm`). On MediaPipe and
+  ONNX the tools do not reach a Gemma 4 model.
+- **Audio on MediaPipe**: the engine passes audio on Android and iOS, but the
+  `.task` files carry no audio encoder (Gemma 3n included); use a `.litertlm`
+  model for audio.
+- **Thinking.** *Tags*: models that write their reasoning between `<think>`
+  tags (Qwen3, DeepSeek R1). Core parses the tags, so this works on any engine.
+  *Full* adds Gemma 4's separate thinking channel, which needs LiteRT-LM
+  (`.litertlm`) — native or web.
+- **Built-in AI**: vision works on Android. On iOS and macOS it needs OS 27 and
+  an app built with the OS 27 SDK, and is not verified on a device yet; on OS 26
+  it is text-only. Apple Foundation Models (iOS and macOS 26+) also has native
+  tool calling.
+  `BuiltInAiEngine` does not pass tools to it, because `InferenceChat` already
+  runs the tool loop; you can reach it through the experimental
+  `BuiltInAiModel.localAiModel`. Gemini Nano, Phi Silica and the Chrome Prompt
+  API have no native tool calling. Phi Silica returns the whole reply as one
+  chunk instead of streaming it.
+
+## Checking support at runtime
+
+There is no single "what can this engine do" call. Support is settled in three
+places.
+
+**Which runtime runs a model** follows the file type you declare when you
+install it (`ModelFileType`). If no registered engine can run it, creating the
+model throws a `StateError` that names the `ModelFileType` and the registered
+engines. Embedding and speech
+backends are chosen the same way; a vector store is chosen by its
+`VectorStoreSpec.providerId` among the providers passed to `FlutterEdgeAiRag`.
+
+**What the device can do** has explicit checks:
+
+```dart
+// OS models: is Gemini Nano, Apple Foundation Models or Phi Silica ready here?
+final availability = await BuiltInAi.availability();
+
+// OS models: native tool calling, vision, structured output.
+// LocalAi comes from flutter_local_ai, which flutter_edge_ai_builtin_ai uses;
+// add it as a direct dependency to import it.
+final caps = await LocalAi.capabilities();
+final nativeTools = caps.supportsToolCalling;
+
+final format = ResponseFormat.jsonObject();
+final support = model.structuredOutputSupport;
+final refusal = model.refusalFor(format);
+if (support.isSupported && refusal == null) {
+  final session = await model.openSession(responseFormat: format);
+  try {
+    // Use the structured session.
+  } finally {
+    await session.close();
+  }
+}
+
+// Vector stores: can a registered provider open this store on this platform?
+// (rag: a FlutterEdgeAiRag instance)
+final canOpen = rag.canOpen(spec);
+```
+
+`LocalAi.capabilities()` describes the underlying OS API; it does not bypass
+`flutter_edge_ai`'s per-platform qualification gate.
+
+**Model features are flags you set**: `supportImage` and `supportAudio` on
+`getActiveModel`, `supportsFunctionCalls` and `enableThinking` on `openChat`
+(a MediaPipe chat on Android or iOS also needs `supportImage: true` on
+`openChat`, or the image is dropped).
+ONNX and Built-in AI, and LiteRT-LM on web, throw `UnsupportedError` for image
+or audio input they cannot take.
+
+After a model loads, `InferenceModel.activeBackend` and
+`EmbeddingModel.activeBackend` report the accelerator it actually runs on, and
+`InferenceModel.activeVisionBackend` and `activeAudioBackend` where its vision
+and audio encoders run (`flutter_edge_ai` 2.4.0, filled by
+`flutter_edge_ai_litertlm` 1.14.0; null when the model has no such encoder or
+the engine does not say).

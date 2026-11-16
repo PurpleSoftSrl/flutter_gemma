@@ -1,0 +1,1954 @@
+import 'dart:async';
+import 'dart:collection';
+import 'dart:convert';
+
+import 'package:flutter/foundation.dart';
+import 'package:flutter_edge_ai/src/extensions.dart';
+import 'package:flutter_edge_ai/src/function_call_parser.dart';
+import 'package:flutter_edge_ai/src/message.dart';
+import 'package:flutter_edge_ai/src/model_response.dart';
+import 'package:flutter_edge_ai/src/parsing/sdk_response_parser.dart';
+import 'package:flutter_edge_ai/src/parsing/sdk_text_extractor.dart';
+import 'package:flutter_edge_ai/src/tool.dart';
+import 'package:flutter_edge_ai/src/interface.dart';
+import 'package:flutter_edge_ai/src/structured/response_format.dart';
+import 'package:flutter_edge_ai/src/structured/structured_output.dart';
+import 'package:flutter_edge_ai/src/structured/structured_session.dart';
+import 'package:mutex/mutex.dart';
+
+import 'model.dart';
+import 'package:flutter_edge_ai/src/utils/edge_ai_log.dart';
+
+/// Default maximum length for function call buffer before flushing as text.
+/// Must accommodate verbose formats (DeepSeek tags, parallel calls).
+const int defaultMaxFunctionBufferLength = 1024;
+
+/// How long a chat turn whose text failed waits for that text to close
+/// before it delivers the error without it; see `_takingBackOnError`. An
+/// engine that keeps the SPI contract ends its text right after an error.
+@visibleForTesting
+Duration chatTurnErrorEndTimeout = const Duration(seconds: 5);
+
+class InferenceChat {
+  final Future<InferenceModelSession> Function()? sessionCreator;
+  final int maxTokens;
+  final int tokenBuffer;
+  final bool supportImage;
+  final bool supportAudio;
+  final bool supportsFunctionCalls;
+  final int maxFunctionBufferLength;
+  final ModelType modelType; // Add modelType parameter
+  /// Whether the app asked to see the model's reasoning. Off, it is requested
+  /// off where the model can switch it off, and hidden either way.
+  final bool enableThinking;
+  final ModelFileType fileType; // Add fileType parameter
+  final ToolChoice toolChoice; // Tool calling mode
+
+  /// The session this chat generates on: core's structured session for a
+  /// chat with a [responseFormat], else the engine's. Set by [initSession],
+  /// and again whenever the chat rebuilds its session. [ChatTurnHooks] always
+  /// receive the engine's own.
+  InferenceModelSession get session => _session ?? (throw _NoSessionError());
+  set session(InferenceModelSession value) => _session = value;
+  InferenceModelSession? _session;
+
+  /// [session] — a subclass may override it — or null before there is one.
+  InferenceModelSession? get _sessionIfAny {
+    try {
+      return session;
+    } on _NoSessionError {
+      return null;
+    }
+  }
+
+  /// The format every reply must have, read from [session] (core's structured
+  /// session carries it), so a chat over a session that enforces nothing
+  /// cannot claim one. Null before the chat has a session.
+  ResponseFormat? get responseFormat {
+    final current = _sessionIfAny;
+    return current == null ? null : responseFormatOf(current);
+  }
+
+  /// The engine's own session behind [current], which is what the hooks get.
+  static InferenceModelSession _engine(InferenceModelSession current) =>
+      engineSessionOf(current);
+
+  /// Per-turn behaviour supplied by the engine (or a test); core's own when
+  /// none was given.
+  final ChatTurnHooks _hooks;
+  final List<Tool> _tools;
+
+  /// Tools available to this chat, fixed for the chat's lifetime. A cached
+  /// unmodifiable VIEW over `_tools` (allocated once, reflects the backing
+  /// list) — `tools.isNotEmpty` is read once per generated token on the
+  /// streaming path, so a per-read `List.unmodifiable(_tools)` copy would be
+  /// an O(tools) allocation on the hottest generation loop.
+  late final List<Tool> tools = UnmodifiableListView(_tools);
+
+  /// Engine-supplied override for [runtimeInjectsToolDeclarations]; `null` means
+  /// "derive from the model's function-call format".
+  final bool? _runtimeInjectsToolDeclarationsOverride;
+
+  /// Whether the runtime/SDK injects the tool declarations itself, so this chat
+  /// must NOT weave its own JSON tools prompt (that would double-wrap them). The
+  /// engine's explicit override wins; absent one it derives from the model's
+  /// [FunctionCallFormat] (true for SDK-passthrough models: Gemma 4, and
+  /// FunctionGemma on `.litertlm`). This replaces the former hardcoded
+  /// `modelType == ModelType.gemma4` check, so an engine that injects tools
+  /// natively could opt in for any model type. No shipping engine sets the
+  /// override yet (both models get `true` via their format).
+  ///
+  /// NOTE: this governs the INPUT side only (skipping declaration injection).
+  /// Reading tool calls BACK is still keyed off
+  /// [FunctionCallParser.usesSdkPassthrough] (see [generateChatResponse] /
+  /// [generateChatResponseAsync]), which is model-format-derived and not
+  /// per-chat overridable — so an engine that sets this `true` on a
+  /// non-passthrough model gets calls parsed from the text stream, not from a
+  /// structured SDK response.
+  late final bool runtimeInjectsToolDeclarations =
+      _runtimeInjectsToolDeclarationsOverride ??
+      FunctionCallParser.runtimeInjectsToolDeclarations(
+        modelType,
+        fileType: fileType,
+      );
+
+  /// Serializes genai_primitives sendMessage/generateContent calls so
+  /// concurrent turns can't interleave staging into the shared session buffer.
+  ///
+  /// Internal to the `package:flutter_edge_ai/genai.dart` extension — not part of
+  /// the public API. External `acquire()`/`release()` would deadlock the chat.
+  @internal
+  final Mutex genaiLock = Mutex();
+
+  /// Qwen3's soft switch that turns thinking off for one user turn.
+  static const _noThinkSuffix = ' /no_think';
+
+  /// The messages as the caller gave them ([fullHistory]).
+  final List<Message> _fullHistory = [];
+
+  /// Prefix messages (tools prompt + context message) for replay across
+  /// sessions, as the model received them.
+  final List<Message> _prefixes = [];
+
+  /// The messages the session is rebuilt from, as the model received them
+  /// (a Qwen3 text turn with thinking off carries [_noThinkSuffix]).
+  final List<Message> _modelHistory = [];
+  int _currentTokens = 0;
+  bool _toolsInstructionSent =
+      false; // Flag to track if tools instruction was sent
+
+  /// Where the histories stood before the messages staged for the next turn,
+  /// so that a turn the engine fails can take them back. Null once a turn has
+  /// started.
+  ({int full, int model, int prefixes, int tokens, bool toolsInstructionSent})?
+  _stagedFrom;
+
+  /// The turn that just failed was taken back (see [_takingBackOnError]):
+  /// the tool calls it had committed are gone with it, so the tool loop must
+  /// not answer them.
+  bool _lastTurnTakenBack = false;
+
+  /// [stopGeneration] was called during the current core turn.
+  bool _stopAskedThisTurn = false;
+
+  /// Determines if model history should be cleared after each turn
+  /// FunctionGemma requires single-turn mode (no multi-turn context)
+  bool get _isSingleTurnModel => modelType == ModelType.functionGemma;
+
+  InferenceChat({
+    required this.sessionCreator,
+    required this.maxTokens,
+    this.tokenBuffer = 2000,
+    this.supportImage = false,
+    this.supportAudio = false,
+    this.supportsFunctionCalls = false,
+    this.maxFunctionBufferLength = defaultMaxFunctionBufferLength,
+    this._tools = const [],
+    this.modelType =
+        ModelType.gemmaIt, // Default to gemmaIt for backward compatibility
+    this.enableThinking = false,
+    this.fileType =
+        ModelFileType.task, // Default to task for backward compatibility
+    this.toolChoice =
+        ToolChoice.auto, // Default to auto for backward compatibility
+    bool?
+    runtimeInjectsToolDeclarations, // engine override; null → derive from format
+    String?
+    systemInstruction, // kept for API compatibility, forwarded to session via sessionCreator
+    ChatTurnHooks? turnHooks, // null = core's
+  }) : _runtimeInjectsToolDeclarationsOverride = runtimeInjectsToolDeclarations,
+       _hooks = turnHooks ?? ChatTurnHooks();
+
+  /// Every message of this chat, in order: the user's, the model's answers,
+  /// its tool calls and their results. A model that writes text before it calls
+  /// a tool (Gemma 4 on `.litertlm` does) streams that text, but its history
+  /// entry is the call alone. When the engine's session keeps the transcript
+  /// itself ([ChatTurnHooks.history]), this is that transcript.
+  List<Message> get fullHistory {
+    final current = _sessionIfAny;
+    return List.unmodifiable(
+      (current == null ? null : _hooks.history(_engine(current))) ??
+          _fullHistory,
+    );
+  }
+
+  /// Tokens in use: the engine's count when its session keeps one
+  /// ([ChatTurnHooks.tokenCount]), else this chat's.
+  int get currentTokens {
+    final current = _sessionIfAny;
+    return (current == null ? null : _hooks.tokenCount(_engine(current))) ??
+        _currentTokens;
+  }
+
+  Future<void> initSession() async {
+    session = await sessionCreator!();
+  }
+
+  bool _reportedHiddenThinking = false;
+
+  /// Drops [ThinkingResponse]s when thinking is off, and says once per chat
+  /// when a turn had any. `enableThinking: false` asks the model not to
+  /// reason, and some cannot comply — DeepSeek R1 and Qwen3 Thinking 2507
+  /// always reason, and a template may ignore the flag — so the reasoning
+  /// still costs time and output tokens, and a turn that ran out of budget
+  /// mid-thought arrives with no text at all.
+  Stream<ModelResponse> _hideThinking(Stream<ModelResponse> source) async* {
+    var hidden = 0;
+    await for (final response in source) {
+      if (response is ThinkingResponse) {
+        hidden += response.content.length;
+        continue;
+      }
+      yield response;
+    }
+    if (hidden > 0 && !_reportedHiddenThinking) {
+      _reportedHiddenThinking = true;
+      // A release build is where an empty or slow answer gets reported, and
+      // edgeAiLog is silent there.
+      // ignore: avoid_print
+      print(
+        '[flutter_edge_ai] NOTE: the model reasoned although thinking is off; '
+        '$hidden characters of reasoning were hidden. Not every model can '
+        'switch reasoning off, and hidden reasoning still costs time and '
+        'output tokens. Shown once per chat.',
+      );
+    }
+  }
+
+  Future<void> addQuery(Message message) async {
+    await addQueryChunk(message);
+  }
+
+  Future<void> addQueryChunk(
+    Message message, [
+    bool noTool = false,
+    bool prefix = false,
+  ]) async {
+    _throwIfRebuildFailed();
+    final hooked = _hooks.addQueryChunk(_engine(session), message);
+    if (hooked != null) return hooked;
+    _stagedFrom ??= (
+      full: _fullHistory.length,
+      model: _modelHistory.length,
+      prefixes: _prefixes.length,
+      tokens: _currentTokens,
+      toolsInstructionSent: _toolsInstructionSent,
+    );
+    var messageToSend = message;
+
+    // Only add tools prompt for the first user text message (not a tool response)
+    // and only if the model supports function calls.
+    // Runtime-injected declarations are exempt: when the runtime/SDK renders the
+    // tools itself (today the `tools_json` LiteRT-LM gets at conversation
+    // creation for Gemma 4 and for FunctionGemma on .litertlm; in future, e.g. a
+    // web Prompt API arm passing native `tools`), a Dart-side prompt injection
+    // would double-wrap them. Gated on [runtimeInjectsToolDeclarations], not a
+    // hardcoded model type.
+    if (message.isUser &&
+        message.type == MessageType.text &&
+        !_toolsInstructionSent &&
+        tools.isNotEmpty &&
+        !noTool &&
+        supportsFunctionCalls &&
+        toolChoice != ToolChoice.none &&
+        !runtimeInjectsToolDeclarations) {
+      _toolsInstructionSent = true;
+      final toolsPrompt = createToolsPrompt();
+
+      // Create tools prompt message for both storage and session
+      final toolsPromptMessage = Message(text: toolsPrompt, isUser: true);
+
+      // Send to session
+      await session.addQueryChunk(toolsPromptMessage);
+
+      // Store in _prefixes for replay
+      _prefixes.add(toolsPromptMessage);
+    } else if (!supportsFunctionCalls && tools.isNotEmpty && !noTool) {
+      // Log warning if model doesn't support function calls but tools are provided
+      edgeAiLog(
+        'WARNING: Model does not support function calls, but tools were provided. Tools will be ignored.',
+      );
+    }
+
+    // Qwen3: append /no_think to suppress thinking at model level when not
+    // requested. Only to a plain text turn: in a tool response it is noise,
+    // and next to audio a bundle may print the user's text as the start of
+    // its answer (Qwen3-ASR then returns an empty transcript).
+    // The suffix is for the model only: [fullHistory] keeps the caller's
+    // message, so replaying it through clearHistory(replayHistory:) appends
+    // exactly one suffix again. A text that already ends with it (a history
+    // saved before the suffix stayed out of it) is sent as is.
+    if (!enableThinking &&
+        modelType == ModelType.qwen3 &&
+        message.isUser &&
+        message.type == MessageType.text &&
+        !message.hasAudio &&
+        !message.text.endsWith(_noThinkSuffix)) {
+      messageToSend = messageToSend.copyWith(
+        text: '${messageToSend.text}$_noThinkSuffix',
+      );
+    }
+
+    // --- DETAILED LOGGING ---
+    if (kDebugMode) {
+      final historyForLogging = _modelHistory.map((m) => m.text).join('\n');
+      edgeAiLog('--- Sending to Native ---');
+      edgeAiLog('History:\n$historyForLogging', level: EdgeAiLogLevel.verbose);
+      edgeAiLog(
+        'Current Message:\n${messageToSend.text}',
+        level: EdgeAiLogLevel.verbose,
+      );
+      edgeAiLog('-------------------------');
+    }
+    // --- END LOGGING ---
+
+    await session.addQueryChunk(messageToSend);
+
+    // The app's history keeps the caller's message; the replay lists keep
+    // what the model received, so a rebuilt session gets the same input.
+    _fullHistory.add(message);
+    // If this is a prefix message, add to _prefixes
+    if (prefix) {
+      _prefixes.add(messageToSend);
+    } else {
+      _modelHistory.add(messageToSend);
+    }
+
+    if (message.hasImage) {
+      _currentTokens += 257;
+    }
+  }
+
+  /// Runs one generation and returns its answer: text or the tool call(s).
+  /// When the model writes text before a call, only the call is returned;
+  /// [generateChatResponseAsync] streams the text as well.
+  ///
+  /// In a plain chat, fails with [StateError] when the turn's text completes and
+  /// the session's [InferenceModelSession.startTurn] reports [TurnEnd.closed].
+  /// Any partial text is committed to [fullHistory] first. If the text itself
+  /// fails, the failed-turn take-back rule below applies. An engine whose
+  /// [EngineTurn.end] is null cannot expose the close distinction to core;
+  /// structured chats report it as [IncompleteStructuredOutputException] as
+  /// described below.
+  ///
+  /// A turn the engine fails commits nothing: the messages staged for it, and
+  /// any tool call it had committed, are taken back out of [fullHistory]
+  /// before the error reaches the caller (for an input too long for the
+  /// context window the error is a [ContextLimitException]). A stop is not a
+  /// failure and keeps what was generated; a turn stopped before any text is
+  /// taken back as well. Turns an engine runs through
+  /// [ChatTurnHooks.responses] keep their own history.
+  ///
+  /// In a chat with a [responseFormat] the reply is text, and a reply that
+  /// fails the format's check is committed to [fullHistory], then thrown: a
+  /// [StructuredOutputException] ([IncompleteStructuredOutputException] or
+  /// [NonConformingStructuredOutputException]). Such a turn always runs
+  /// core's path; [ChatTurnHooks.responses] is not called for it.
+  ///
+  /// Core implements this once for every engine (`@nonVirtual`); an engine
+  /// changes a chat's turns through [ChatTurnHooks].
+  @nonVirtual
+  Future<ModelResponse> generateChatResponse() async {
+    if (responseFormat != null) {
+      return _collectResponses(_streamStructuredResponse());
+    }
+    final hooked = _hooks.responses(_engine(session), tokenBuffer: tokenBuffer);
+    if (hooked != null) return _collectResponses(hooked);
+    return _generateCoreResponse();
+  }
+
+  /// One whole turn from [ChatTurnHooks.responses], as
+  /// [generateChatResponse] returns it: the call(s) when there are any,
+  /// else the text.
+  static Future<ModelResponse> _collectResponses(
+    Stream<ModelResponse> responses,
+  ) async {
+    final text = StringBuffer();
+    final calls = <FunctionCallResponse>[];
+    await for (final response in responses) {
+      switch (response) {
+        case TextResponse(:final token):
+          text.write(token);
+        case FunctionCallResponse():
+          calls.add(response);
+        case ParallelFunctionCallResponse():
+          calls.addAll(response.calls);
+        case ThinkingResponse():
+          break;
+      }
+    }
+    if (calls.length == 1) return calls.single;
+    if (calls.isNotEmpty) return ParallelFunctionCallResponse(calls: calls);
+    return TextResponse(text.toString());
+  }
+
+  /// [turn]'s text. A turn whose text fails, for any reason, commits nothing:
+  /// the messages staged for it, and whatever the turn committed before the
+  /// error (a tool call), are taken back out of the history, with the token
+  /// count and the tools-prompt flag, before the error reaches the caller.
+  /// An engine that refused the input for the context window
+  /// ([ContextLimitException], end [TurnEnd.contextLimit]) never added it to
+  /// its context; for any other failure the chat's history is the one to
+  /// replay. A stop or a cancelled subscription is not a failure: what was
+  /// generated is kept, as before.
+  ///
+  /// [takesBack] narrows which errors take the turn back (a structured turn's
+  /// own format failures do not); every error ends the turn the same way.
+  Stream<String> _takingBackOnError(
+    EngineTurn turn, {
+    bool Function(Object error)? takesBack,
+  }) {
+    final staged = _stagedFrom;
+    _stagedFrom = null;
+    _lastTurnTakenBack = false;
+    _stopAskedThisTurn = false;
+    late final StreamController<String> out;
+    StreamSubscription<String>? source;
+    (Object, StackTrace)? failure;
+    var sawText = false;
+    var finished = false;
+    Timer? bound;
+
+    void takeBack() {
+      if (staged == null) return;
+      _fullHistory.length = staged.full;
+      _modelHistory.length = staged.model;
+      _prefixes.length = staged.prefixes;
+      _currentTokens = staged.tokens;
+      _toolsInstructionSent = staged.toolsInstructionSent;
+      _lastTurnTakenBack = true;
+    }
+
+    /// Whether a turn that ended without an error was a stop: the chat's own
+    /// [stopGeneration], or the engine saying so (bounded, as below).
+    Future<bool> wasStopped() async {
+      if (_stopAskedThisTurn) return true;
+      final end = turn.end;
+      if (end == null) return false;
+      try {
+        return await end.timeout(chatTurnErrorEndTimeout) == TurnEnd.stopped;
+      } on TimeoutException {
+        return false;
+      }
+    }
+
+    /// Ends the turn once: when the text closes, or, after an error, at the
+    /// latest [chatTurnErrorEndTimeout] later, so an engine whose failed text
+    /// never closes cannot hold the turn. A failed turn is taken back either
+    /// way, and so is a stopped one that produced no text: nothing of it is
+    /// an exchange worth keeping (llama drops it as well).
+    Future<void> finish() async {
+      if (finished) return;
+      finished = true;
+      bound?.cancel();
+      final failed = failure;
+      if (failed != null) {
+        if (takesBack?.call(failed.$1) ?? true) takeBack();
+        out.addError(failed.$1, failed.$2);
+      } else if (!sawText && await wasStopped()) {
+        takeBack();
+      }
+      // Its done ends the consumer's subscription, and onCancel lets the
+      // source go: a failed text that never closes is not held.
+      await out.close();
+    }
+
+    out = StreamController<String>(
+      onListen: () {
+        source = turn.text.listen(
+          (chunk) {
+            if (chunk.isNotEmpty) sawText = true;
+            out.add(chunk);
+          },
+          onError: (Object error, StackTrace stack) {
+            if (failure != null) return;
+            failure = (error, stack);
+            bound = Timer(chatTurnErrorEndTimeout, () => unawaited(finish()));
+          },
+          onDone: () => unawaited(finish()),
+        );
+      },
+      onPause: () => source?.pause(),
+      onResume: () => source?.resume(),
+      // The consumer's cancel before the turn ended is a stop: a failure it
+      // has not seen yet is not delivered, and nothing is taken back. (Through
+      // the chat's stream a cancel arrives at its next chunk, so a turn
+      // cancelled before any text ends as its engine ends it.)
+      onCancel: () {
+        bound?.cancel();
+        return source?.cancel();
+      },
+    );
+    return out.stream;
+  }
+
+  /// How [turn] ended, once its text has: null when the engine does not say,
+  /// or does not say within [chatTurnErrorEndTimeout] (an engine that keeps
+  /// the SPI contract completes it with the text).
+  static Future<TurnEnd?> _endOf(EngineTurn turn) async {
+    final end = turn.end;
+    if (end == null) return null;
+    try {
+      return await end.timeout(chatTurnErrorEndTimeout);
+    } on TimeoutException {
+      return null;
+    }
+  }
+
+  /// Records the model's text reply in the history; an empty one is not a
+  /// turn worth recording (#325).
+  void _commitText(String text) {
+    if (text.isEmpty) return;
+    final chatMessage = Message(text: text, isUser: false);
+    _fullHistory.add(chatMessage);
+    _modelHistory.add(chatMessage);
+  }
+
+  /// Decision H (B90): a plain turn that the session's or model's close ended
+  /// under the consumer is an error, not a reply.
+  static void _throwIfClosed(TurnEnd? end) {
+    if (end == TurnEnd.closed) {
+      throw StateError(
+        'The session was closed during this turn (close(), uninstallModel, '
+        'or a replaced active model); the reply is incomplete.',
+      );
+    }
+  }
+
+  Future<ModelResponse> _generateCoreResponse() async {
+    edgeAiLog('InferenceChat: Getting response from native model...');
+    final turn = startEngineTurn(session);
+    final response = await _takingBackOnError(turn).join();
+    final end = await _endOf(turn);
+    final cleanedResponse = ModelThinkingFilter.cleanResponse(
+      response,
+      enableThinking: enableThinking,
+      modelType: modelType,
+      fileType: fileType,
+    );
+
+    if (end == TurnEnd.closed) {
+      // Committed before the error, as the streaming path does.
+      _commitText(cleanedResponse);
+      _throwIfClosed(end);
+    }
+
+    // SDK-passthrough path (Gemma 4, and FunctionGemma on .litertlm): the SDK
+    // already parsed the model's call tokens into structured `tool_calls` JSON.
+    // Read it from session.lastRawResponse before falling back to the legacy
+    // regex parser on cleanedResponse. Keyed off the format (mirrors the
+    // streaming path below), not a hardcoded model type.
+    if (FunctionCallParser.usesSdkPassthrough(modelType, fileType: fileType) &&
+        tools.isNotEmpty &&
+        supportsFunctionCalls &&
+        toolChoice != ToolChoice.none &&
+        session is RawSdkResponseSession) {
+      final raw = (session as RawSdkResponseSession).lastRawResponse;
+      if (raw != null) {
+        final allCalls = SdkResponseParser.extractToolCalls(raw);
+        if (allCalls.isNotEmpty) {
+          edgeAiLog(
+            'InferenceChat: Detected ${allCalls.length} SDK-parsed tool call(s)',
+          );
+          // Strip Gemma 4 escape tokens (`<|"|>`) before persisting to history.
+          // Keeping raw lets the SDK echo those tokens back into the next
+          // prompt and the model reproduces them in later tool_calls (#248).
+          // Only the call objects: text written before the call is not part
+          // of the call (see toolCallsRawForHistory).
+          final cleanRaw = toolCallsRawForHistory(raw);
+          final toolCallMessage = Message.toolCall(
+            text: cleanRaw,
+            calls: allCalls,
+          );
+          _fullHistory.add(toolCallMessage);
+          _modelHistory.add(toolCallMessage);
+          if (allCalls.length == 1) return allCalls.first;
+          return ParallelFunctionCallResponse(calls: allCalls);
+        }
+      }
+    }
+
+    if (cleanedResponse.isEmpty) {
+      edgeAiLog(
+        'InferenceChat: Raw response from native model is EMPTY after cleaning.',
+      );
+      return const TextResponse(''); // Return TextResponse instead of String
+    }
+
+    edgeAiLog(
+      'InferenceChat: Raw response from native model:\n--- START ---\n$cleanedResponse\n--- END ---',
+      level: EdgeAiLogLevel.verbose,
+    );
+
+    // Try to parse as function call if tools are available and model supports function calls
+    if (tools.isNotEmpty &&
+        supportsFunctionCalls &&
+        toolChoice != ToolChoice.none) {
+      final allCalls = FunctionCallParser.parseAll(
+        cleanedResponse,
+        modelType: modelType,
+      );
+      if (allCalls.isNotEmpty) {
+        edgeAiLog(
+          'InferenceChat: Detected ${allCalls.length} function call(s) in sync response',
+        );
+        final toolCallMessage = Message.toolCall(
+          text: cleanedResponse,
+          calls: allCalls,
+        );
+        _fullHistory.add(toolCallMessage);
+        _modelHistory.add(toolCallMessage);
+        edgeAiLog(
+          'InferenceChat: Added tool call to history: ${toolCallMessage.text}',
+          level: EdgeAiLogLevel.verbose,
+        );
+        if (allCalls.length == 1) {
+          return allCalls.first;
+        }
+        return ParallelFunctionCallResponse(calls: allCalls);
+      }
+    }
+
+    // Regular text response
+    _commitText(cleanedResponse);
+
+    // Clear model history for single-turn models (e.g., FunctionGemma)
+    if (_isSingleTurnModel) {
+      edgeAiLog(
+        'InferenceChat: Single-turn model detected, clearing model history...',
+      );
+      _modelHistory.clear();
+      _prefixes.clear();
+      _currentTokens = 0;
+      _toolsInstructionSent = false;
+
+      // Recreate session to clear native state
+      await session.close();
+      session = await sessionCreator!();
+      edgeAiLog('InferenceChat: Model history cleared and session recreated');
+    }
+
+    return TextResponse(
+      cleanedResponse,
+    ); // Return TextResponse instead of String
+  }
+
+  /// Streams this turn's response token-by-token.
+  ///
+  /// INVARIANT (critical for every consumer): each yielded [FunctionCallResponse]
+  /// / [ParallelFunctionCallResponse] has ALREADY been committed to the
+  /// persistent chat history (`_fullHistory` + `_modelHistory`) at the moment it
+  /// is yielded — committed *before* the yield so a tool-response feeds in AFTER
+  /// it in history order. Because the call is committed on yield, any consumer
+  /// that collects these calls MUST answer every one (via [addQueryChunk] with a
+  /// [Message.toolResponse]) on EVERY exit path — normal completion,
+  /// cancellation, a tool throwing, AND a mid-stream stream error — or the
+  /// committed call is left dangling with no response and poisons the next turn
+  /// on this reused chat. [generateChatResponseWithTools] is the reference
+  /// implementation that balances all four paths; new consumers should prefer it
+  /// over re-driving this stream directly.
+  ///
+  /// In a plain chat, fails with [StateError] when the turn's text completes and
+  /// the session's [InferenceModelSession.startTurn] reports [TurnEnd.closed].
+  /// Any partial text is committed to [fullHistory] first. If the text itself
+  /// fails, the failed-turn take-back rule below applies. An engine whose
+  /// [EngineTurn.end] is null cannot expose the close distinction to core;
+  /// structured chats report it as [IncompleteStructuredOutputException] as
+  /// described below. A failure to count the reply's tokens or to rebuild the
+  /// session after a full context is the stream's error too, after the reply has
+  /// been committed to [fullHistory].
+  ///
+  /// A turn the engine fails commits nothing: the messages staged for it, and
+  /// any tool call it had committed, are taken back out of [fullHistory]
+  /// before the error reaches the caller (for an input too long for the
+  /// context window the error is a [ContextLimitException]). A stop is not a
+  /// failure and keeps what was generated; a turn stopped before any text is
+  /// taken back as well. Turns an engine runs through
+  /// [ChatTurnHooks.responses] keep their own history.
+  ///
+  /// In a chat with a [responseFormat] the stream yields the reply's text,
+  /// and a reply that fails the format's check is committed to
+  /// [fullHistory], then the stream's error: a [StructuredOutputException].
+  /// Such a turn always runs core's path; [ChatTurnHooks.responses] is not
+  /// called for it. Cancelling the subscription stops the generation.
+  ///
+  /// Core implements this once for every engine (`@nonVirtual`); an engine
+  /// changes a chat's turns through [ChatTurnHooks].
+  @nonVirtual
+  Stream<ModelResponse> generateChatResponseAsync() {
+    _lastTurnTakenBack = false;
+    // Without a session yet, core's stream fails when it is listened to, as
+    // it always has.
+    final current = _sessionIfAny;
+    if (current != null && responseFormatOf(current) != null) {
+      return _streamStructuredResponse();
+    }
+    return (current == null
+            ? null
+            : _hooks.responses(_engine(current), tokenBuffer: tokenBuffer)) ??
+        _streamCoreResponse();
+  }
+
+  /// One turn of a chat with a [responseFormat], over core's structured
+  /// session: text only, no thinking filter and no tool parsing (both are
+  /// refused with a format).
+  ///
+  /// A reply that failed the format's check (incomplete or non-conforming)
+  /// is committed and counted before that failure is thrown, as a plain
+  /// turn's reply is before a close's; a reply cut by a close is not counted
+  /// (the session is gone). A failed count after such a reply is printed,
+  /// never thrown over the format's failure; a failed session rebuild is kept
+  /// and thrown by the next turn ([addQueryChunk], [generateChatResponse],
+  /// [generateChatResponseAsync]) before the closed session is touched, until
+  /// [clearHistory] gets the chat a new session. Any other error — the
+  /// engine's own, a `ResponseFormatUnsupportedException` from an engine that
+  /// refuses the schema at the first send among them — reaches the caller
+  /// unchanged, and the turn is taken back as a plain turn the engine fails
+  /// is: the messages staged for it leave the history. So is a turn stopped
+  /// before any text (its failure is still the incomplete reply), as a plain
+  /// turn stopped before any text is.
+  Stream<ModelResponse> _streamStructuredResponse() async* {
+    _throwIfRebuildFailed();
+    // The same take-back and the same bounded wait after an error as a
+    // plain turn; the format's own failures are not the engine failing.
+    final text = _takingBackOnError(
+      EngineTurn(text: session.getResponseAsync(), end: null),
+      takesBack: (error) => switch (error) {
+        IncompleteStructuredOutputException(
+          end: TurnEnd.stopped,
+          partialText: '',
+        ) =>
+          true,
+        IncompleteStructuredOutputException() ||
+        NonConformingStructuredOutputException() => false,
+        _ => true,
+      },
+    );
+    final buffer = StringBuffer();
+    StructuredOutputException? failure;
+    StackTrace? failureStack;
+    try {
+      await for (final chunk in text) {
+        buffer.write(chunk);
+        yield TextResponse(chunk);
+      }
+    } on IncompleteStructuredOutputException catch (error, stack) {
+      failure = error;
+      failureStack = stack;
+    } on NonConformingStructuredOutputException catch (error, stack) {
+      failure = error;
+      failureStack = stack;
+    }
+    final response = buffer.toString();
+    // A turn stopped before any text was taken back: nothing to keep.
+    if (failure != null && _lastTurnTakenBack) {
+      Error.throwWithStackTrace(failure, failureStack!);
+    }
+    _commitText(response);
+    if (failure == null) {
+      await _accountReply(response, emittedFunctionCall: false);
+      return;
+    }
+    if (failure case IncompleteStructuredOutputException(end: TurnEnd.closed)) {
+      Error.throwWithStackTrace(failure, failureStack!);
+    }
+    try {
+      await _accountReply(
+        response,
+        emittedFunctionCall: false,
+        onRebuildFailed: (error, stack) =>
+            _failedRebuild = (error: error, stack: stack),
+      );
+    } catch (countError) {
+      // The format's failure is what the caller acts on; a release build is
+      // where this shows, and edgeAiLog is silent there.
+      // ignore: avoid_print
+      print(
+        '[flutter_edge_ai] WARNING: after a structured reply that failed its '
+        'check, counting its tokens failed too ($countError).',
+      );
+    }
+    Error.throwWithStackTrace(failure, failureStack!);
+  }
+
+  /// A session rebuild that failed after a structured reply whose own
+  /// failure was that turn's error. The chat still holds the session it
+  /// closed, so every later turn throws this instead of a misleading "session
+  /// is closed", until [clearHistory] gets the chat a new session.
+  ({Object error, StackTrace stack})? _failedRebuild;
+
+  void _throwIfRebuildFailed() {
+    if (_failedRebuild case (:final error, :final stack)) {
+      Error.throwWithStackTrace(error, stack);
+    }
+  }
+
+  Stream<ModelResponse> _streamCoreResponse() async* {
+    edgeAiLog('InferenceChat: Starting async stream generation');
+    final buffer = StringBuffer();
+
+    // Smart function handling mode - continuous scanning for JSON patterns
+    String funcBuffer = '';
+
+    edgeAiLog('InferenceChat: Starting to iterate over native tokens...');
+
+    // Track if we emitted a function call (to record correct history and skip session clearing)
+    bool emittedFunctionCall = false;
+
+    // SDK-passthrough tool-call suppression (Gemma 4, and FunctionGemma on
+    // .litertlm; keyed off the format, not the model — see
+    // FunctionCallParser.usesSdkPassthrough). The
+    // C++ runtime streams a tool-call turn as the raw
+    // `{"role":"assistant","tool_calls":[...]}` JSON (one or more concatenated
+    // objects) AND exposes it via lastRawResponse. The passthrough format reports
+    // "no function call in text", so the funcBuffer below never suppresses those
+    // tokens — without this they leak into the text channel (agent
+    // TextChunkEvent / voice synthesis). We classify the turn on its first
+    // non-whitespace char: a '{' means a tool-call JSON turn, which we swallow
+    // (the structured call is surfaced from lastRawResponse at end-of-stream);
+    // anything else is plain text and streams normally. Other formats are
+    // excluded by the guard below, so this first-char probe only ever runs for
+    // the passthrough format — it never misfires on a text-stream format's
+    // JSON-ish output. A turn may also be prose and then a call: Gemma 4 often
+    // writes a sentence before it calls a tool. The call then arrives as a
+    // chunk of its own, a `tool_calls` object with no content
+    // (isSdkToolCallChunk), which is taken out of the stream before the
+    // thinking filter; the prose streams, and the call is surfaced at
+    // end-of-stream like any other. Such a chunk is kept, and surfaced as text
+    // if no call can be read from it. Without this guard (calls not handled)
+    // such a chunk stays in the text as JSON. The prose written before a call
+    // is not recorded in history (see toolCallsRawForHistory).
+    final bool sdkPassthrough =
+        FunctionCallParser.usesSdkPassthrough(modelType, fileType: fileType) &&
+        tools.isNotEmpty &&
+        supportsFunctionCalls &&
+        toolChoice != ToolChoice.none &&
+        session is RawSdkResponseSession;
+    bool sdkClassified = false; // has this turn been classified yet?
+    bool sdkSwallow = false; // swallowing a tool-call JSON stream?
+    String sdkProbe = ''; // pre-classification token accumulator
+    final sdkSwallowed =
+        StringBuffer(); // swallowed JSON (fallback if unparsed)
+    bool sdkCallChunkTaken = false; // a call chunk left out of the text?
+
+    // A call chunk (isSdkToolCallChunk) is taken out of the text here, on the
+    // session's own chunks: the thinking filter below may hold back the end of
+    // a prose chunk and join it to the next one. It is kept in sdkSwallowed, so
+    // a call that cannot be read at end-of-stream still reaches the caller.
+    final turn = startEngineTurn(session);
+    final originalStream = _takingBackOnError(turn)
+        .where((token) {
+          if (!sdkPassthrough || !isSdkToolCallChunk(token)) return true;
+          sdkSwallowed.write(token);
+          sdkCallChunkTaken = true;
+          return false;
+        })
+        .map((token) => TextResponse(token));
+
+    // Split reasoning out of the stream for every model: a bundle that
+    // declares a thought channel streams its reasoning there whatever the
+    // family, and a model may think even when thinking is off (a
+    // thinking-only model, or a template that ignores enable_thinking).
+    final Stream<ModelResponse> filteredStream =
+        ModelThinkingFilter.filterThinkingStream(
+          originalStream,
+          modelType: modelType,
+        );
+
+    // If user didn't request thinking, discard ThinkingResponse events
+    final Stream<ModelResponse> thinkingHandledStream = enableThinking
+        ? filteredStream
+        : _hideThinking(filteredStream);
+
+    await for (final response in thinkingHandledStream) {
+      if (response is TextResponse) {
+        final token = response.token;
+        if (kDebugMode) {
+          edgeAiLog(
+            'InferenceChat: Received filtered token: "$token"',
+            level: EdgeAiLogLevel.verbose,
+          );
+        }
+
+        // Gemma 4 SDK-passthrough classification (see `sdkPassthrough` above).
+        // Runs before the generic funcBuffer scanning, which is a no-op for the
+        // passthrough format anyway (it never detects a call in the text stream).
+        if (sdkPassthrough) {
+          if (sdkSwallow) {
+            // Inside a tool-call JSON stream — swallow every token.
+            sdkSwallowed.write(token);
+            continue;
+          }
+          if (!sdkClassified) {
+            sdkProbe += token;
+            final trimmed = sdkProbe.trimLeft();
+            if (trimmed.isEmpty) continue; // whitespace only — keep probing
+            sdkClassified = true;
+            if (trimmed.startsWith('{')) {
+              // Tool-call JSON turn — swallow this and all following tokens.
+              sdkSwallow = true;
+              sdkSwallowed.write(sdkProbe);
+              continue;
+            }
+            // Plain-text turn — emit the probed prefix, then stream the rest.
+            yield TextResponse(sdkProbe);
+            buffer.write(sdkProbe);
+            continue;
+          }
+          // Already classified as plain text — stream token-by-token.
+          yield response;
+          buffer.write(token);
+          continue;
+        }
+
+        // Track if this token should be added to buffer (default true)
+        bool shouldAddToBuffer = true;
+
+        // Continuous scanning for function calls in text - for models like DeepSeek
+        if (tools.isNotEmpty &&
+            supportsFunctionCalls &&
+            toolChoice != ToolChoice.none) {
+          // Check if we're currently buffering potential JSON
+          if (funcBuffer.isNotEmpty) {
+            // We're already buffering - add token and check for completion
+            funcBuffer += token;
+            if (kDebugMode) {
+              edgeAiLog(
+                'InferenceChat: Buffering token: "$token", total: ${funcBuffer.length} chars',
+                level: EdgeAiLogLevel.verbose,
+              );
+            }
+
+            // Check if we now have a complete JSON
+            if (FunctionCallParser.isFunctionCallComplete(
+              funcBuffer,
+              modelType: modelType,
+            )) {
+              // First try to extract message from any JSON with message field
+              final message = _jsonMessageField(funcBuffer);
+              if (message != null) {
+                if (kDebugMode) {
+                  edgeAiLog(
+                    'InferenceChat: Extracted message from JSON: "$message"',
+                    level: EdgeAiLogLevel.verbose,
+                  );
+                }
+                yield TextResponse(message);
+                // The reply is the message, not its JSON: that is what the
+                // history keeps.
+                buffer.write(message);
+                funcBuffer = '';
+                shouldAddToBuffer = false; // Don't add JSON tokens to buffer
+                continue;
+              }
+
+              // If no message field found, try parsing as function call(s)
+              final allCalls = FunctionCallParser.parseAll(
+                funcBuffer,
+                modelType: modelType,
+              );
+              if (allCalls.isNotEmpty) {
+                edgeAiLog(
+                  'InferenceChat: Found ${allCalls.length} function call(s) in complete buffer!',
+                );
+                emittedFunctionCall = true;
+                // Add function call to history IMMEDIATELY (before yielding)
+                // so tool response from caller comes AFTER in history order
+                final toolCallMessage = Message.toolCall(
+                  text: funcBuffer,
+                  calls: allCalls,
+                );
+                _fullHistory.add(toolCallMessage);
+                _modelHistory.add(toolCallMessage);
+                edgeAiLog(
+                  'InferenceChat: Added function call to history before yielding',
+                );
+                if (allCalls.length == 1) {
+                  yield allCalls.first;
+                } else {
+                  yield ParallelFunctionCallResponse(calls: allCalls);
+                }
+                funcBuffer = '';
+                shouldAddToBuffer = false;
+                continue;
+              } else {
+                // Not a valid function call - emit as text and clear buffer
+                edgeAiLog('InferenceChat: Invalid JSON, emitting as text');
+                yield TextResponse(funcBuffer);
+                funcBuffer = '';
+                shouldAddToBuffer = false;
+                continue;
+              }
+            }
+
+            // If buffer gets too long without completing, flush as text
+            if (funcBuffer.length > maxFunctionBufferLength) {
+              edgeAiLog(
+                'InferenceChat: Buffer too long without completion, flushing as text',
+              );
+              yield TextResponse(funcBuffer);
+              funcBuffer = '';
+              shouldAddToBuffer = false;
+              continue;
+            }
+
+            // Still buffering, don't emit yet
+            shouldAddToBuffer = false;
+          } else {
+            // Not currently buffering - check if this token starts a function call
+            if (FunctionCallParser.isFunctionCallStart(
+              token,
+              modelType: modelType,
+            )) {
+              if (kDebugMode) {
+                edgeAiLog(
+                  'InferenceChat: Found potential function call start in token: "$token"',
+                  level: EdgeAiLogLevel.verbose,
+                );
+              }
+              funcBuffer = token;
+              shouldAddToBuffer =
+                  false; // Don't add to main buffer while we determine if it's JSON
+            } else if (modelType == ModelType.functionGemma &&
+                token.trim() == functionGemmaEndCall) {
+              // The call's closing brace already completed the buffer, so this
+              // trailing tag belongs to no call. It is markup, not text —
+              // emitting it would show `<end_function_call>` to the user and
+              // write it into chat history.
+              shouldAddToBuffer = false;
+            } else {
+              // Normal text token - emit immediately
+              if (kDebugMode) {
+                edgeAiLog(
+                  'InferenceChat: Emitting text token: "$token"',
+                  level: EdgeAiLogLevel.verbose,
+                );
+              }
+              yield response;
+              shouldAddToBuffer = true; // Add to main buffer for history
+            }
+          }
+        } else {
+          // No function processing happening - emit token directly
+          if (kDebugMode) {
+            edgeAiLog(
+              'InferenceChat: No function processing, emitting token as text: "$token"',
+              level: EdgeAiLogLevel.verbose,
+            );
+          }
+          yield response;
+          shouldAddToBuffer = true; // Add to main buffer for history
+        }
+
+        // Add token to buffer only if it should be included in final message
+        if (shouldAddToBuffer) {
+          buffer.write(token);
+        }
+      } else {
+        // For non-TextResponse (like ThinkingResponse), pass through
+        yield response;
+      }
+    }
+
+    edgeAiLog('InferenceChat: Native token stream ended');
+    final end = await _endOf(turn);
+
+    // The stream ended before we classified this Gemma 4 turn (e.g. a
+    // whitespace-only reply) — the probed tokens are plain text, flush them.
+    if (sdkPassthrough && !sdkClassified && sdkProbe.isNotEmpty) {
+      yield TextResponse(sdkProbe);
+      buffer.write(sdkProbe);
+    }
+
+    final response = buffer.toString();
+    edgeAiLog(
+      'InferenceChat: Complete response accumulated: "$response"',
+      level: EdgeAiLogLevel.verbose,
+    );
+
+    // SDK-passthrough path (same guard that swallowed the tool-call JSON above):
+    // the structured tool calls live in `lastRawResponse`. Surface them here as
+    // the final ModelResponse(s).
+    if (sdkPassthrough) {
+      final raw = (session as RawSdkResponseSession).lastRawResponse;
+      if (raw != null) {
+        final allCalls = SdkResponseParser.extractToolCalls(raw);
+        if (allCalls.isNotEmpty) {
+          edgeAiLog(
+            'InferenceChat: ${allCalls.length} SDK-parsed tool call(s) at end of stream',
+          );
+          emittedFunctionCall = true;
+          // Record the tool-call in history BEFORE yielding (mirrors the sync
+          // SDK path at ~L193 and the JSON paths) — otherwise the caller's
+          // tool-response has no matching call and is left orphaned, which
+          // corrupts the replayed history when the Gemma 4 session rotates.
+          // Strip the Gemma 4 escape tokens first, same as the sync path (#248),
+          // and keep only the call objects: prose streamed before the call is
+          // not part of it (see toolCallsRawForHistory).
+          final cleanRaw = toolCallsRawForHistory(raw);
+          final toolCallMessage = Message.toolCall(
+            text: cleanRaw,
+            calls: allCalls,
+          );
+          _fullHistory.add(toolCallMessage);
+          _modelHistory.add(toolCallMessage);
+          if (allCalls.length == 1) {
+            yield allCalls.first;
+          } else {
+            yield ParallelFunctionCallResponse(calls: allCalls);
+          }
+        }
+      }
+    }
+
+    // Safety net: we suppressed a `{`-leading SDK-passthrough stream, or took
+    // a call chunk out of the text, as a tool call, but lastRawResponse yielded
+    // no parseable call (or there is none). Don't silently drop
+    // the model's output — surface the swallowed text (as it leaked pre-fix). It
+    // is deliberately NOT re-recorded to history: this only fires on a degenerate
+    // turn (a `{`-leading passthrough turn with no extractable tool_calls), where
+    // re-appending the JSON-shaped blob as an assistant turn would pollute the
+    // model's next-turn context more than omitting it.
+    if ((sdkSwallow || sdkCallChunkTaken) &&
+        !emittedFunctionCall &&
+        sdkSwallowed.isNotEmpty) {
+      edgeAiLog(
+        'InferenceChat: SDK tool-call stream suppressed but no call parsed — '
+        'surfacing raw text (fallback)',
+      );
+      yield TextResponse(sdkSwallowed.toString());
+    }
+
+    // Handle end of stream - process any remaining buffer
+    if (funcBuffer.isNotEmpty) {
+      edgeAiLog(
+        'InferenceChat: Processing remaining buffer at end of stream: ${funcBuffer.length} chars',
+      );
+
+      // For FunctionGemma, the function call spans response + funcBuffer
+      // (e.g., response="<start_function_call>call:fn", funcBuffer="{params}")
+      // For JSON models, funcBuffer contains the complete JSON
+      final contentToCheck = modelType == ModelType.functionGemma
+          ? response + funcBuffer
+          : funcBuffer;
+
+      // First try to extract message from JSON if it has message field
+      if (FunctionCallParser.isFunctionCallComplete(
+        contentToCheck,
+        modelType: modelType,
+      )) {
+        // For JSON parsing, use funcBuffer (the actual JSON part)
+        // For FunctionGemma parsing, use contentToCheck (full function call)
+        final message = modelType == ModelType.functionGemma
+            ? null
+            : _jsonMessageField(funcBuffer);
+        if (message != null) {
+          edgeAiLog(
+            'InferenceChat: Extracted message from end-of-stream JSON: "$message"',
+            level: EdgeAiLogLevel.verbose,
+          );
+          yield TextResponse(message);
+          _commitText(message);
+          _throwIfClosed(end);
+          return;
+        }
+        try {
+          // Try to parse as function call(s)
+          final allCalls = FunctionCallParser.parseAll(
+            contentToCheck,
+            modelType: modelType,
+          );
+          if (allCalls.isNotEmpty) {
+            edgeAiLog(
+              'InferenceChat: ${allCalls.length} function call(s) found at end of stream',
+            );
+            emittedFunctionCall = true;
+            // Add function call to history IMMEDIATELY (before yielding)
+            final toolCallMessage = Message.toolCall(
+              text: contentToCheck,
+              calls: allCalls,
+            );
+            _fullHistory.add(toolCallMessage);
+            _modelHistory.add(toolCallMessage);
+            edgeAiLog(
+              'InferenceChat: Added function call to history at end of stream',
+            );
+            if (allCalls.length == 1) {
+              yield allCalls.first;
+            } else {
+              yield ParallelFunctionCallResponse(calls: allCalls);
+            }
+          } else {
+            yield TextResponse(funcBuffer);
+          }
+        } catch (e) {
+          edgeAiLog('InferenceChat: Failed to parse end-of-stream JSON: $e');
+          yield TextResponse(funcBuffer);
+        }
+      } else {
+        edgeAiLog(
+          'InferenceChat: No complete JSON at end of stream, emitting remaining as text',
+        );
+        yield TextResponse(funcBuffer);
+      }
+    }
+
+    // The reply is committed before anything below can throw (B80, B90), so
+    // the history keeps what the consumer was shown. For function calls it is
+    // already there (added when yielded); an EMPTY text reply is skipped: a
+    // stream stopped before any text token ends with response == '', and
+    // that empty assistant turn would make later short replies come back
+    // empty (#325).
+    if (!emittedFunctionCall) _commitText(response);
+    _throwIfClosed(end);
+
+    await _accountReply(response, emittedFunctionCall: emittedFunctionCall);
+
+    edgeAiLog(
+      'InferenceChat: generateChatResponseAsync completed successfully',
+    );
+  }
+
+  /// After a committed reply: counts its tokens, rebuilds the session when
+  /// the context is nearly full, and starts a single-turn model's next turn
+  /// on a fresh session.
+  ///
+  /// With [onRebuildFailed], a failed rebuild goes to it instead of being
+  /// thrown; a failed count is thrown either way.
+  Future<void> _accountReply(
+    String response, {
+    required bool emittedFunctionCall,
+    void Function(Object error, StackTrace stack)? onRebuildFailed,
+  }) async {
+    Future<void> rebuild(Future<void> Function() step) async {
+      if (onRebuildFailed == null) return step();
+      try {
+        await step();
+      } catch (error, stack) {
+        onRebuildFailed(error, stack);
+      }
+    }
+
+    edgeAiLog('InferenceChat: Calculating response tokens...');
+    final responseTokens = await session.sizeInTokens(response);
+    _currentTokens += responseTokens;
+    edgeAiLog('InferenceChat: Current total tokens: $_currentTokens');
+    final used = _hooks.tokenCount(_engine(session)) ?? _currentTokens;
+    if (used >= (maxTokens - tokenBuffer)) {
+      edgeAiLog('InferenceChat: Token limit reached, recreating session...');
+      await rebuild(_recreateSessionWithReducedChunks);
+      edgeAiLog('InferenceChat: Session recreated successfully');
+    }
+
+    // Clear model history for single-turn models (e.g., FunctionGemma)
+    // BUT only if this was NOT a function call - we need context for tool response
+    if (_isSingleTurnModel && !emittedFunctionCall) {
+      edgeAiLog(
+        'InferenceChat: Single-turn model detected (text response), clearing model history...',
+      );
+      _modelHistory.clear();
+      _prefixes.clear();
+      _currentTokens = 0;
+      _toolsInstructionSent = false;
+
+      // Recreate session to clear native state
+      await rebuild(() async {
+        await session.close();
+        session = await sessionCreator!();
+      });
+      edgeAiLog('InferenceChat: Model history cleared and session recreated');
+    } else if (_isSingleTurnModel && emittedFunctionCall) {
+      edgeAiLog(
+        'InferenceChat: Single-turn model with function call - keeping history for tool response',
+      );
+    }
+  }
+
+  /// Drive flutter_edge_ai's function-calling loop to completion. Stream this
+  /// turn's text/thinking tokens; whenever the model calls a tool, run
+  /// [onToolCall] and feed its result back as a tool-response message, then
+  /// continue — until a turn has no calls (the model's final answer) or
+  /// [maxToolTurns] / [isCancelled] stops it.
+  ///
+  /// PRECONDITION: the user message must already be staged (call [addQueryChunk]
+  /// first), same as [generateChatResponseAsync]. [onToolCall] returns the
+  /// `{...}` response map fed back via [Message.toolResponse]. Tool *execution*
+  /// is the caller's (tools are app actions); core only parses the call and
+  /// drives the loop. [onMaxToolTurns], when supplied, is invoked once if the
+  /// loop exhausts [maxToolTurns] without a call-free answer — so a consumer
+  /// driving this loop can surface its own terminal signal (e.g. AgentLoop's
+  /// MaxIterationsEvent).
+  ///
+  /// Errors: an exception from [onToolCall], or a result [jsonEncode] cannot
+  /// write, is answered to the model (the call's siblings in that turn as not
+  /// run) and then rethrown on the stream; so is an error from the generation
+  /// itself, after its committed calls are answered. A balancing answer the
+  /// session rejects is printed, never thrown over the original error.
+  Stream<ModelResponse> generateChatResponseWithTools({
+    required FutureOr<Map<String, dynamic>> Function(FunctionCallResponse call)
+    onToolCall,
+    int maxToolTurns = 8,
+    bool Function()? isCancelled,
+    void Function()? onMaxToolTurns,
+  }) async* {
+    if (maxToolTurns < 1) {
+      // A cap below 1 would exit before any generation — the already-staged
+      // user turn would get NO response and the stream would close empty (a
+      // silent no-op). Fail loud (asserts are stripped in release).
+      throw RangeError.range(maxToolTurns, 1, null, 'maxToolTurns');
+    }
+    for (var turn = 0; turn < maxToolTurns; turn++) {
+      if (isCancelled?.call() ?? false) return;
+      final pending = <FunctionCallResponse>[];
+      try {
+        await for (final r in generateChatResponseAsync()) {
+          // Exhaustive over the sealed ModelResponse: a future subtype fails to
+          // compile here instead of silently passing through as text.
+          switch (r) {
+            case FunctionCallResponse():
+              pending.add(r);
+            case ParallelFunctionCallResponse(:final calls):
+              pending.addAll(calls);
+            case TextResponse() || ThinkingResponse():
+              yield r; // pass through to the caller's text/thinking stream
+          }
+        }
+      } catch (_) {
+        // generateChatResponseAsync commits each tool-call to the persistent
+        // history the moment it yields it (see the callsites above). A mid-stream
+        // decode error rethrows past the balancing below, leaving a committed
+        // call with no tool-response — it dangles and poisons the next turn on
+        // this reused chat. Answer the collected calls first, then rethrow the
+        // ORIGINAL error (the failure still surfaces to the caller — never
+        // hidden).
+        // A turn the engine failed was taken back, its calls with it: there
+        // is nothing committed to answer.
+        if (_lastTurnTakenBack) rethrow;
+        if (pending.isNotEmpty) {
+          edgeAiLog(
+            'InferenceChat.generateChatResponseWithTools: generation stream '
+            'errored mid-turn; balancing ${pending.length} committed '
+            'tool-call(s) before rethrowing.',
+          );
+        }
+        try {
+          await _answerToolCalls(pending, const {
+            'status': 'failed',
+            'error': 'generation stream errored before this tool call ran',
+          });
+        } catch (balanceError) {
+          // The already-errored session rejected the balancing feed too. Do NOT
+          // let that mask the original failure — log loudly and still rethrow the
+          // original below. The caller's safe recovery is to recreate the session
+          // / clearHistory(replayHistory:), which the Dart-side history makes
+          // correct once the session is usable again.
+          _logUnbalanced('a stream error', balanceError);
+        }
+        rethrow;
+      }
+      if (pending.isEmpty) return; // model's final (call-free) answer
+
+      // generateChatResponseAsync already committed the assistant tool-call(s)
+      // to history; EVERY committed call must get a matching tool-response or
+      // the (persistent, reused-across-turns) chat is left with a dangling
+      // call that poisons the next turn (the model re-issues it or replies
+      // empty). So both abnormal exits below balance the history first.
+      if (isCancelled?.call() ?? false) {
+        // Barge-in after generation, before execution: don't run the tools,
+        // but still answer the committed call(s) with a cancelled marker.
+        await _answerToolCalls(pending, const {'status': 'cancelled'});
+        return;
+      }
+      for (var i = 0; i < pending.length; i++) {
+        if (isCancelled?.call() ?? false) {
+          // Barge-in landed mid-turn (between individual tool calls). Don't run
+          // the remaining tools' side effects — mirrors AgentLoop's between-call
+          // check (agent_loop.dart) — but answer every not-yet-run call (i..end)
+          // with a cancelled marker so no committed call is left dangling, then
+          // stop. On the voice detach path the per-turn token stays cancelled
+          // forever, so a still-running DETACHED loop bails here at the next
+          // tool boundary instead of executing the rest of this turn's tools.
+          await _answerToolCalls(pending.sublist(i), const {
+            'status': 'cancelled',
+          });
+          return;
+        }
+        final call = pending[i];
+        Map<String, dynamic>? response;
+        final Message reply;
+        try {
+          response = await onToolCall(call);
+          // Built inside the try: a result jsonEncode cannot write (a
+          // DateTime, say) fails the call like a throwing tool, instead of
+          // leaving it committed with no response.
+          reply = Message.toolResponse(
+            toolName: call.name,
+            response: response,
+            toolCallId: call.id,
+          );
+        } catch (e) {
+          // The app's tool threw, or its result could not be encoded. Answer
+          // the call (and any siblings in this turn not yet run) so the
+          // committed call isn't left dangling, then rethrow so the caller
+          // sees the failure. A tool that returned has run: saying so keeps
+          // the model from running it again.
+          try {
+            await _answerToolCalls(
+              [call],
+              response == null
+                  ? {'error': '$e'}
+                  : const {
+                      'status': 'ran',
+                      'error': 'the result could not be encoded as JSON',
+                    },
+            );
+          } catch (balanceError) {
+            _logUnbalanced('a tool failure', balanceError);
+          }
+          try {
+            await _answerToolCalls(pending.sublist(i + 1), const {
+              'status': 'not run — an earlier tool call in this turn failed',
+            });
+          } catch (balanceError) {
+            _logUnbalanced('a tool failure', balanceError);
+          }
+          // The tool's error, not a balancing one: that is what the caller
+          // has to act on.
+          rethrow;
+        }
+        await addQueryChunk(reply);
+      }
+    }
+    // Exhausted maxToolTurns with calls still pending: each turn's calls WERE
+    // answered, but no final call-free generation ran, so the reply may be
+    // empty/truncated. Log it (and notify [onMaxToolTurns], so a consumer that
+    // drives this loop can surface its own terminal — e.g. AgentLoop's
+    // MaxIterationsEvent) — silent truncation would violate the
+    // no-masking-failure rule.
+    onMaxToolTurns?.call();
+    edgeAiLog(
+      'InferenceChat.generateChatResponseWithTools: hit maxToolTurns '
+      '($maxToolTurns) with tool calls still pending; stopping. The reply may '
+      'be empty or truncated — the model never produced a call-free answer.',
+    );
+  }
+
+  /// Feeds a fixed [response] as the tool-response for each of [calls]. Used to
+  /// balance history when a turn is cancelled or a tool throws mid-turn, so a
+  /// committed tool-call is never left without a matching response. Every call
+  /// is tried even when one feed fails; the first failure is rethrown after.
+  Future<void> _answerToolCalls(
+    List<FunctionCallResponse> calls,
+    Map<String, dynamic> response,
+  ) async {
+    (Object, StackTrace)? firstFailure;
+    for (final call in calls) {
+      try {
+        await addQueryChunk(
+          Message.toolResponse(
+            toolName: call.name,
+            response: response,
+            toolCallId: call.id,
+          ),
+        );
+      } catch (e, stack) {
+        firstFailure ??= (e, stack);
+      }
+    }
+    if (firstFailure case (final error, final stack)) {
+      Error.throwWithStackTrace(error, stack);
+    }
+  }
+
+  /// Printed, not thrown: a failed balancing feed must not replace the error
+  /// that made the loop balance in the first place ([cause]). A release build
+  /// is where the next turn goes wrong, and edgeAiLog is silent there.
+  void _logUnbalanced(String cause, Object balanceError) {
+    // ignore: avoid_print
+    print(
+      '[flutter_edge_ai] WARNING: InferenceChat.generateChatResponseWithTools '
+      'could not answer a committed tool call after $cause ($balanceError); '
+      'the persistent chat history may be left unbalanced. Recover by '
+      'recreating the session.',
+    );
+  }
+
+  /// The `message` of a `{"message": "..."}` reply, which is text rather than
+  /// a call, or `null` when [buffer] is not one. A decode error says only that
+  /// [buffer] is not bare JSON: a tagged or fenced call is not, and it must
+  /// still reach the call parser.
+  static String? _jsonMessageField(String buffer) {
+    final Object? json;
+    try {
+      json = jsonDecode(buffer);
+    } on FormatException {
+      return null;
+    }
+    if (json is! Map<String, dynamic>) return null;
+    final message = json['message'];
+    return message is String ? message : null;
+  }
+
+  Future<void> _recreateSessionWithReducedChunks() async {
+    // A session that keeps the transcript itself is rebuilt from it: the
+    // engine owns what fits its context.
+    final engineHistory = _hooks.history(_engine(session));
+    if (engineHistory != null) {
+      final kept = List.of(engineHistory);
+      await session.close();
+      session = await sessionCreator!();
+      for (final message in kept) {
+        await (_hooks.addQueryChunk(_engine(session), message) ??
+            session.addQueryChunk(message));
+      }
+      await _hooks.replayFinished(_engine(session));
+      return;
+    }
+
+    while (_currentTokens >= (maxTokens - tokenBuffer) &&
+        _modelHistory.isNotEmpty) {
+      final removedMessage = _modelHistory.removeAt(0);
+      final size = await session.sizeInTokens(removedMessage.text);
+      _currentTokens -= size;
+
+      // Count all images (message.images can have multiple)
+      final imageCount = removedMessage.images.length;
+      if (imageCount > 0) {
+        _currentTokens -= imageCount * 257;
+      }
+    }
+
+    await session.close();
+    session = await sessionCreator!();
+
+    // Replay prefixes first (explicit prefix messages)
+    for (final prefix in _prefixes) {
+      await session.addQueryChunk(prefix);
+    }
+
+    // Then replay model history
+    for (final message in _modelHistory) {
+      await session.addQueryChunk(message);
+    }
+  }
+
+  void _resetHistory() {
+    _stagedFrom = null;
+    _fullHistory.clear();
+    _prefixes.clear();
+    _modelHistory.clear();
+    _currentTokens = 0;
+    _toolsInstructionSent = false;
+  }
+
+  /// Starts the chat over on a new session, replaying [replayHistory] into
+  /// it when given. A replay that throws does not leave a partly staged
+  /// conversation: the chat starts over on another new session, empty, and
+  /// the error is rethrown.
+  Future<void> clearHistory({List<Message>? replayHistory}) async {
+    _resetHistory();
+    await session.close();
+    session = await sessionCreator!();
+    _failedRebuild = null;
+    if (replayHistory == null) return;
+    try {
+      for (final message in replayHistory) {
+        await addQueryChunk(message);
+      }
+      await _hooks.replayFinished(_engine(session));
+    } catch (error, stack) {
+      try {
+        _resetHistory();
+        await session.close();
+        session = await sessionCreator!();
+        await _hooks.replayFailed(_engine(session), error);
+      } catch (recoveryError) {
+        // The replay's error is what the caller has to act on; a release
+        // build is where a failed recovery shows, and edgeAiLog is silent
+        // there.
+        // ignore: avoid_print
+        print(
+          '[flutter_edge_ai] WARNING: InferenceChat.clearHistory could not '
+          'start over after a failed replay ($recoveryError); the chat has no '
+          'usable session.',
+        );
+      }
+      Error.throwWithStackTrace(error, stack);
+    }
+  }
+
+  bool get supportsImages => supportImage;
+
+  int get imageMessageCount => fullHistory.where((msg) => msg.hasImage).length;
+
+  Future<void> stopGeneration() {
+    _stopAskedThisTurn = true;
+    return session.stopGeneration();
+  }
+
+  Future<void> close() => session.close();
+
+  /// Creates tools prompt based on model type and tool choice.
+  /// Made package-private for testing.
+  @visibleForTesting
+  String createToolsPrompt() {
+    if (tools.isEmpty) {
+      return '';
+    }
+
+    // ToolChoice.none — don't inject tools prompt at all
+    if (toolChoice == ToolChoice.none) {
+      return '';
+    }
+
+    // Explicit routing by ModelType using Dart 3 switch expression
+    return switch (modelType) {
+      ModelType.functionGemma => _createFunctionGemmaToolsPrompt(),
+      // All other models use JSON format
+      _ => _createJsonToolsPrompt(),
+    };
+  }
+
+  String _createJsonToolsPrompt() {
+    final toolsPrompt = StringBuffer();
+
+    // Instruction varies by ToolChoice mode
+    switch (toolChoice) {
+      case ToolChoice.auto:
+        toolsPrompt.writeln(
+          'You have access to functions. ONLY call a function when the user explicitly requests an action or command (like "change color", "show alert", "set title"). For regular conversation, greetings, and questions, respond normally without calling any functions.',
+        );
+      case ToolChoice.required:
+        toolsPrompt.writeln(
+          'You have access to functions. You MUST respond with a function call. Do not respond with plain text. Always select the most appropriate function based on the user\'s message.',
+        );
+      case ToolChoice.none:
+        return ''; // Should not reach here, but defensive
+    }
+
+    toolsPrompt.writeln(
+      'When you do need to call a function, respond with ONLY the JSON in this format: {"name": function_name, "parameters": {argument: value}}',
+    );
+    toolsPrompt.writeln(
+      'After the function is executed, you will get a response. Then provide a helpful message to the user about what was accomplished.',
+    );
+    toolsPrompt.writeln('<tool_code>');
+    for (final tool in tools) {
+      toolsPrompt.writeln(
+        '${tool.name}: ${tool.description} Parameters: ${jsonEncode(tool.parameters)}',
+      );
+    }
+    toolsPrompt.writeln('</tool_code>');
+    return toolsPrompt.toString();
+  }
+
+  String _createFunctionGemmaToolsPrompt() {
+    if (toolChoice == ToolChoice.required) {
+      // The model's chat_template renders a developer turn of declarations plus
+      // an optional system text. Nothing in the format expresses "you must call
+      // a function", so honouring `required` would mean inventing tokens the
+      // model was never trained on. Say so rather than ignore it.
+      edgeAiLog(
+        'WARNING: ToolChoice.required is not supported by FunctionGemma — its '
+        'prompt format cannot express it. Behaving as ToolChoice.auto.',
+      );
+    }
+
+    final toolsPrompt = StringBuffer();
+
+    // FunctionGemma requires developer turn for tools definition
+    toolsPrompt.write('$startTurn$developerPrefix\n');
+    toolsPrompt.writeln(
+      'You are a model that can do function calling with the following functions',
+    );
+
+    for (final tool in tools) {
+      toolsPrompt.write(functionGemmaStartDecl);
+      toolsPrompt.write('declaration:${tool.name}{');
+      toolsPrompt.write(
+        'description:$functionGemmaEscape${tool.description}$functionGemmaEscape',
+      );
+
+      // The template gates `parameters` on the parameters map itself, and emits
+      // `type` independently of `properties`. So a no-argument tool still gets
+      // `parameters:{type:<escape>OBJECT<escape>}` — gating on `properties`
+      // dropped the whole block for `get_time`-style tools.
+      if (tool.parameters.isNotEmpty) {
+        final properties =
+            tool.parameters['properties'] as Map<String, dynamic>?;
+        final required = tool.parameters['required'] as List<dynamic>?;
+
+        final parts = <String>[];
+        if (properties != null && properties.isNotEmpty) {
+          parts.add(
+            'properties:{${_formatFunctionGemmaProperties(properties, tool.name)}}',
+          );
+        }
+        if (required != null && required.isNotEmpty) {
+          parts.add('required:[${_formatFunctionGemmaRequired(required)}]');
+        }
+        parts.add('type:${functionGemmaEscape}OBJECT$functionGemmaEscape');
+
+        toolsPrompt.write(',parameters:{${parts.join(',')}}');
+      }
+
+      toolsPrompt.writeln('}$functionGemmaEndDecl');
+    }
+
+    toolsPrompt.write('$endTurn\n');
+    return toolsPrompt.toString();
+  }
+
+  // The helpers below mirror FunctionGemma's own `chat_template.jinja`
+  // (`format_function_declaration` / `format_argument`). The template is the
+  // spec — the model was trained on what it renders, so any divergence here
+  // feeds the model a declaration shape it has never seen.
+
+  /// Property names the template reserves for structure. It skips any property
+  /// that collides with one, so we skip it too rather than emit a declaration
+  /// the model cannot parse.
+  static const _functionGemmaStructuralKeys = {
+    'description',
+    'type',
+    'properties',
+    'required',
+    'nullable',
+  };
+
+  String _formatFunctionGemmaRequired(List<dynamic> required) => required
+      .map(
+        (r) =>
+            '$functionGemmaEscape${functionGemmaScalar(r)}$functionGemmaEscape',
+      )
+      .join(',');
+
+  /// The declaration must name one concrete type per property. `properties` and
+  /// `items` imply their type in JSON Schema — reading them is inference, not a
+  /// guess. Anything else is unknowable, and guessing STRING would make the
+  /// model quote numbers back at us, so say so instead.
+  String _inferFunctionGemmaType(
+    Map<String, dynamic> schema,
+    String toolName,
+    String propertyName,
+  ) {
+    if (schema.containsKey('properties')) return 'OBJECT';
+    if (schema.containsKey('items')) return 'ARRAY';
+    throw ArgumentError(
+      'FunctionGemma requires an explicit type for property "$propertyName" '
+      'of tool "$toolName". '
+      'Declare one of: string, number, integer, boolean, array, object.',
+    );
+  }
+
+  String _formatFunctionGemmaProperties(
+    Map<String, dynamic> properties,
+    String toolName,
+  ) {
+    final entries = <String>[];
+
+    // NOT `functionGemmaDictsort`: the template sorts, but a tool's properties
+    // reach the model in the order the app declared them, and every model
+    // fine-tuned before 1.2.3 — including via our own colab — learned that
+    // order. On the base model, sorting changed nothing measurable (device A/B
+    // on 12 prompts: same hits, same misses). Fidelity to the template is not
+    // worth breaking existing fine-tunes. `items` keys and map arguments still
+    // dictsort: they are new in 1.2.3 and no prompt ever depended on them.
+    for (final name in properties.keys) {
+      if (_functionGemmaStructuralKeys.contains(name)) continue;
+      final schema = properties[name];
+      if (schema is! Map<String, dynamic>) continue;
+
+      final rawType = schema['type'];
+      if (rawType is List) {
+        // The template renders a union as a Python list repr the model has
+        // never seen.
+        throw ArgumentError(
+          'FunctionGemma does not support union types (property "$name" of '
+          'tool "$toolName" declares type: $rawType). '
+          'Declare a single type and mark it nullable: true.',
+        );
+      }
+      if (rawType != null && rawType is! String) {
+        throw ArgumentError(
+          'FunctionGemma property "$name" of tool "$toolName" declares a '
+          'non-string type: $rawType.',
+        );
+      }
+
+      final type =
+          (rawType as String?)?.toUpperCase() ??
+          _inferFunctionGemmaType(schema, toolName, name);
+
+      final description = schema['description'];
+      final property = StringBuffer(
+        '$name:{description:$functionGemmaEscape'
+        // An explicit null renders empty here, not as Python's `None`.
+        '${description == null ? '' : functionGemmaScalar(description)}'
+        '$functionGemmaEscape',
+      );
+
+      // Validate before the type check: an enum on a NUMBER property is dropped
+      // by the template, but a poisoned value is still a caller bug worth naming.
+      final enumValues = schema['enum'] as List<dynamic>?;
+      if (enumValues != null && enumValues.isNotEmpty) {
+        _assertNoSpecialTokens(enumValues);
+      }
+
+      switch (type) {
+        case 'STRING':
+          if (enumValues != null && enumValues.isNotEmpty) {
+            property.write(',enum:${functionGemmaArgument(enumValues)}');
+          }
+        case 'OBJECT':
+          final nested = schema['properties'];
+          property.write(',properties:{');
+          if (nested is Map<String, dynamic>) {
+            property.write(_formatFunctionGemmaProperties(nested, toolName));
+          }
+          property.write('}');
+          final nestedRequired = schema['required'] as List<dynamic>?;
+          if (nestedRequired != null && nestedRequired.isNotEmpty) {
+            property.write(
+              ',required:[${_formatFunctionGemmaRequired(nestedRequired)}]',
+            );
+          }
+        case 'ARRAY':
+          final items = schema['items'];
+          if (items is Map<String, dynamic> && items.isNotEmpty) {
+            property.write(
+              ',items:{${_formatFunctionGemmaItems(items, toolName)}}',
+            );
+          }
+      }
+
+      property.write(',type:$functionGemmaEscape$type$functionGemmaEscape}');
+      entries.add(property.toString());
+    }
+
+    return entries.join(',');
+  }
+
+  String _formatFunctionGemmaItems(
+    Map<String, dynamic> items,
+    String toolName,
+  ) {
+    final parts = <String>[];
+
+    for (final key in functionGemmaDictsort(items.keys)) {
+      final value = items[key];
+      if (value == null) continue;
+
+      switch (key) {
+        case 'properties':
+          final nested = value is Map<String, dynamic>
+              ? _formatFunctionGemmaProperties(value, toolName)
+              : '';
+          parts.add('properties:{$nested}');
+        case 'required':
+          // No emptiness guard here, unlike the object level: the template
+          // guards `required` on a property but not inside `items`, so an
+          // empty list still renders as `required:[]`.
+          if (value is List<dynamic>) {
+            parts.add('required:[${_formatFunctionGemmaRequired(value)}]');
+          }
+        case 'type':
+          // An array's element type may itself be a union, e.g. ['string','number'].
+          final upper = value is List
+              ? value.map((v) => '$v'.toUpperCase()).toList()
+              : '$value'.toUpperCase();
+          parts.add('type:${functionGemmaArgument(upper)}');
+        default:
+          parts.add('$key:${functionGemmaArgument(value)}');
+      }
+    }
+
+    return parts.join(',');
+  }
+
+  void _assertNoSpecialTokens(List<dynamic> enumValues) {
+    for (final value in enumValues) {
+      final str = value.toString();
+      if (str.contains(functionGemmaEscape) ||
+          str.contains('<start_') ||
+          str.contains('<end_')) {
+        throw ArgumentError(
+          'Enum value "$str" contains FunctionGemma special tokens',
+        );
+      }
+    }
+  }
+}
+
+/// What an engine (or a test) changes about one chat's turns: an engine
+/// returns one from `InferenceModel.createChatTurnHooks`, once per chat, and
+/// a test passes one to [InferenceChat]'s constructor.
+///
+/// Core never calls [responses] for a chat with a `responseFormat`: a
+/// structured turn always uses the guarded [InferenceModelSession.startTurn]
+/// path. When [responses] returns non-null it replaces the whole plain turn;
+/// the hook and engine own generation, parsing, history, token accounting,
+/// take-back and overflow rebuild behavior. Core does not append that turn to
+/// its own history.
+///
+/// A `base class` (instantiable) whose defaults are core's behaviour, so a
+/// member added later arrives with its default. Subclasses are `base` or
+/// `final`.
+base class ChatTurnHooks {
+  ChatTurnHooks();
+
+  /// The whole of one turn — generation, parsing, token accounting, the
+  /// history append, the overflow rebuild — or null for core's.
+  Stream<ModelResponse>? responses(
+    InferenceModelSession session, {
+    required int tokenBuffer,
+  }) => null;
+
+  /// The transcript, when the session keeps it itself; null = the chat's.
+  /// When non-null, core's rebuilds replay this list (through
+  /// [addQueryChunk]), and `imageMessageCount` counts it.
+  List<Message>? history(InferenceModelSession session) => null;
+
+  /// Tokens in use, when the session counts them; null = the chat's count.
+  int? tokenCount(InferenceModelSession session) => null;
+
+  /// Queue [message] the engine's way; null = core's (tool prompt, prefix).
+  Future<void>? addQueryChunk(InferenceModelSession session, Message message) =>
+      null;
+
+  /// After `clearHistory(replayHistory:)` replayed every message, and after
+  /// a rebuild replayed [history].
+  Future<void> replayFinished(InferenceModelSession session) async {}
+
+  /// After a replay threw: the chat has already reopened its session; the
+  /// hook may undo engine-side staging. The error is rethrown after it.
+  Future<void> replayFailed(
+    InferenceModelSession session,
+    Object error,
+  ) async {}
+}
+
+/// [InferenceChat.session] read before the chat has one.
+final class _NoSessionError extends StateError {
+  _NoSessionError()
+    : super('This chat has no session yet: call initSession() first.');
+}

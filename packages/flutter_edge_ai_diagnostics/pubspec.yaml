@@ -1,0 +1,41 @@
+name: flutter_edge_ai_diagnostics
+description: "Opt-in Android, iOS, macOS, Linux and Windows process memory diagnostics: footprint or commit, its peak, resident file-backed pages and available memory, read from the OS."
+version: 0.6.1
+homepage: https://flutteredge.ai
+repository: https://github.com/DenisovAV/flutter_edge_ai/tree/main/packages/flutter_edge_ai_diagnostics
+topics: [memory, diagnostics, gemma, on-device]
+
+# Android, iOS, macOS, Linux and Windows, on purpose: jetsam and lmkd are why
+# the mobile numbers differ from RSS, macOS shares the Mach call iOS uses, Linux
+# reads the same /proc files Android does, and Windows reads its commit charge
+# and working set from kernel32. Linux and Windows have no per-app limit like
+# jetsam's, but "what does a model cost" and "how much headroom is left" are the
+# same questions there. Every value is read from the OS (/proc on Android and
+# Linux, Mach + libsystem on iOS and macOS, kernel32 on Windows) through
+# dart:io and dart:ffi, so the package carries no Kotlin, Swift, Gradle,
+# podspec or CMake.
+platforms:
+  android:
+  ios:
+  linux:
+  macos:
+  windows:
+
+resolution: workspace
+
+environment:
+  sdk: '>=3.12.0 <4.0.0'
+  flutter: '>=3.44.0'
+
+# No flutter_edge_ai dependency: the probe measures the process, not an engine,
+# so it works next to any engine and can sit in dev_dependencies.
+dependencies:
+  flutter:
+    sdk: flutter
+  ffi: ^2.1.0
+  meta: ^1.15.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0

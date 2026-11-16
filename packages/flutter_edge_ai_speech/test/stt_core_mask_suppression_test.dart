@@ -1,0 +1,263 @@
+import 'dart:typed_data';
+
+import 'package:flutter_edge_ai_speech/src/litert/stt_core.dart'
+    show
+        acceptDecodedToken,
+        applySuppression,
+        greedyDecodeStep,
+        runGreedyDecode,
+        writeDecoderMask;
+import 'package:flutter_edge_ai_speech/src/model/stt_model_profile.dart'
+    show SttDecoderMaskConvention;
+import 'package:flutter_edge_ai_speech/src/tokenizer/stt_special_tokens.dart'
+    show ResolvedSuppression;
+import 'package:flutter_test/flutter_test.dart';
+
+void main() {
+  group('writeDecoderMask', () {
+    test(
+      'paddingOnly: valid iff j<len, identical across every row (moonshine convention C)',
+      () {
+        const maxTokens = 4;
+        final mask = Float32List(maxTokens * maxTokens);
+        writeDecoderMask(
+          mask,
+          maxTokens: maxTokens,
+          len: 2,
+          convention: SttDecoderMaskConvention.paddingOnly,
+        );
+        for (var r = 0; r < maxTokens; r++) {
+          expect(mask[r * maxTokens + 0], 0.0, reason: 'row $r col 0');
+          expect(mask[r * maxTokens + 1], 0.0, reason: 'row $r col 1');
+          expect(mask[r * maxTokens + 2], -1e9, reason: 'row $r col 2');
+          expect(mask[r * maxTokens + 3], -1e9, reason: 'row $r col 3');
+        }
+      },
+    );
+
+    test('causal: valid iff j<=r AND j<len', () {
+      const maxTokens = 4;
+      final mask = Float32List(maxTokens * maxTokens);
+      writeDecoderMask(
+        mask,
+        maxTokens: maxTokens,
+        len: 3,
+        convention: SttDecoderMaskConvention.causal,
+      );
+      // row 0: only j=0 valid (j<=0 and j<3)
+      expect(mask[0 * maxTokens + 0], 0.0);
+      expect(mask[0 * maxTokens + 1], -1e9);
+      // row 2: j=0,1,2 valid (all <=2 and <3)
+      expect(mask[2 * maxTokens + 0], 0.0);
+      expect(mask[2 * maxTokens + 1], 0.0);
+      expect(mask[2 * maxTokens + 2], 0.0);
+      // row 3: j<=3 but j<len(3) caps it at j=0,1,2 -- j=3 invalid (not <3)
+      expect(mask[3 * maxTokens + 3], -1e9);
+    });
+  });
+
+  group('applySuppression', () {
+    test('null suppression leaves the row untouched', () {
+      final row = Float32List.fromList([1.0, 2.0, 3.0]);
+      applySuppression(row, step: 0, suppression: null);
+      expect(row, [1.0, 2.0, 3.0]);
+    });
+
+    test('forces every id above suppressAboveId to -inf, every step', () {
+      final row = Float32List.fromList([1.0, 2.0, 3.0, 4.0, 5.0]);
+      const suppression = ResolvedSuppression(
+        suppressAboveId: 2,
+        suppressAtStepZeroIds: {},
+      );
+      applySuppression(row, step: 5, suppression: suppression);
+      expect(row.sublist(0, 3), [1.0, 2.0, 3.0]);
+      expect(row[3], double.negativeInfinity);
+      expect(row[4], double.negativeInfinity);
+    });
+
+    test('forces suppressAtStepZeroIds to -inf ONLY at step 0', () {
+      const suppression = ResolvedSuppression(
+        suppressAboveId: 100,
+        suppressAtStepZeroIds: {1},
+      );
+      final atZero = Float32List.fromList([1.0, 2.0, 3.0]);
+      applySuppression(atZero, step: 0, suppression: suppression);
+      expect(atZero[1], double.negativeInfinity);
+
+      final laterStep = Float32List.fromList([1.0, 2.0, 3.0]);
+      applySuppression(laterStep, step: 1, suppression: suppression);
+      expect(laterStep[1], 2.0);
+    });
+
+    test('argmax never returns a suppressed id', () {
+      final row = Float32List.fromList([
+        1.0,
+        100.0,
+        3.0,
+      ]); // id 1 is the raw max
+      const suppression = ResolvedSuppression(
+        suppressAboveId: 100,
+        suppressAtStepZeroIds: {1},
+      );
+      applySuppression(row, step: 0, suppression: suppression);
+      var bestIndex = 0;
+      var bestValue = row[0];
+      for (var i = 1; i < row.length; i++) {
+        if (row[i] > bestValue) {
+          bestValue = row[i];
+          bestIndex = i;
+        }
+      }
+      expect(bestIndex, isNot(1));
+    });
+  });
+
+  group('greedyDecodeStep (#747)', () {
+    test('a clean row returns the argmax', () {
+      final row = Float32List.fromList([0.1, 0.9, 0.3]);
+      expect(greedyDecodeStep(row, step: 0, suppression: null), 1);
+    });
+
+    test('a NaN away from the winner is caught, not skipped by argmax', () {
+      // argmax's `>` is NaN-blind: it would return 1 here.
+      final row = Float32List.fromList([0.1, 0.9, double.nan, 0.3]);
+      expect(greedyDecodeStep(row, step: 0, suppression: null), isNull);
+    });
+
+    test('a NaN in a slot suppression overwrites is still caught', () {
+      const suppression = ResolvedSuppression(
+        suppressAboveId: 1,
+        suppressAtStepZeroIds: {},
+      );
+      final row = Float32List.fromList([0.1, 0.9, double.nan, 5.0]);
+      expect(greedyDecodeStep(row, step: 3, suppression: suppression), isNull);
+    });
+
+    test('suppression applies before the argmax', () {
+      const suppression = ResolvedSuppression(
+        suppressAboveId: 1,
+        suppressAtStepZeroIds: {},
+      );
+      final row = Float32List.fromList([0.1, 0.9, 7.0, 5.0]);
+      expect(greedyDecodeStep(row, step: 3, suppression: suppression), 1);
+    });
+  });
+
+  group('acceptDecodedToken (#747)', () {
+    test('a pick is the token', () {
+      expect(acceptDecodedToken(42, step: 3), 42);
+      expect(acceptDecodedToken(0, step: 3), 0);
+    });
+
+    test('a NaN row (null) throws, naming the step', () {
+      expect(
+        () => acceptDecodedToken(null, step: 3),
+        throwsA(
+          isA<StateError>().having(
+            (e) => e.message,
+            'message',
+            contains('NaN logits at step 3'),
+          ),
+        ),
+      );
+    });
+
+    test('a NaN anywhere in the row reaches the error', () {
+      final row = Float32List.fromList([0.1, 0.9, double.nan]);
+      expect(
+        () => acceptDecodedToken(
+          greedyDecodeStep(row, step: 0, suppression: null),
+          step: 1,
+        ),
+        throwsStateError,
+      );
+    });
+  });
+
+  group('runGreedyDecode (#747)', () {
+    // A row whose largest logit is [winner], with [runnerUp] second.
+    Float32List row(int winner, {int? runnerUp}) {
+      final r = Float32List(8)..[winner] = 1.0;
+      if (runnerUp != null) r[runnerUp] = 0.5;
+      return r;
+    }
+
+    test('decodes several steps from the prompt to EOS', () {
+      final seen = <List<int>>[];
+      final rows = [row(5), row(6), row(2)];
+      final ids = runGreedyDecode(
+        promptIds: const [1],
+        maxTokens: 8,
+        eosId: 2,
+        suppression: null,
+        decoderRow: (generated) {
+          seen.add(List.of(generated));
+          return rows[seen.length - 1];
+        },
+      );
+      expect(ids, [1, 5, 6, 2]);
+      // Each step sees every token so far.
+      expect(seen, [
+        [1],
+        [1, 5],
+        [1, 5, 6],
+      ]);
+    });
+
+    test('suppression runs at the step counted from the prompt', () {
+      // Step 0 blocks id 5 (Whisper's step-zero list): the first row's winner
+      // is 5, so the pick is its runner-up 4. Later steps may pick 5. With a
+      // two-token prompt, a step counted from the start (2) would not block
+      // it, and a step stuck at 0 would block it every time.
+      const suppression = ResolvedSuppression(
+        suppressAboveId: 7,
+        suppressAtStepZeroIds: {5},
+      );
+      final rows = [row(5, runnerUp: 4), row(5, runnerUp: 4), row(2)];
+      var i = 0;
+      final ids = runGreedyDecode(
+        promptIds: const [1, 3],
+        maxTokens: 8,
+        eosId: 2,
+        suppression: suppression,
+        decoderRow: (_) => rows[i++],
+      );
+      expect(ids, [1, 3, 4, 5, 2]);
+    });
+
+    test('a NaN at the second step throws, naming that step', () {
+      final rows = [
+        row(3),
+        Float32List.fromList([0.1, double.nan, 0.2, 0.3, 0, 0, 0, 0]),
+      ];
+      var i = 0;
+      expect(
+        () => runGreedyDecode(
+          promptIds: const [1],
+          maxTokens: 8,
+          eosId: 2,
+          suppression: null,
+          decoderRow: (_) => rows[i++],
+        ),
+        throwsA(
+          isA<StateError>().having(
+            (e) => e.message,
+            'message',
+            contains('NaN logits at step 1'),
+          ),
+        ),
+      );
+    });
+
+    test('stops at maxTokens, prompt included, without EOS', () {
+      final ids = runGreedyDecode(
+        promptIds: const [1, 4],
+        maxTokens: 5,
+        eosId: 2,
+        suppression: null,
+        decoderRow: (_) => row(7),
+      );
+      expect(ids, [1, 4, 7, 7, 7]);
+    });
+  });
+}

@@ -1,0 +1,73 @@
+## 1.3.0
+- Sessions open through core's `openEngineSession`; `openChat` takes the model's own type and audio.
+- Android: a streamed reply no longer loses chunks while the UI thread is busy.
+- Failed turns and turns stopped before producing text are removed from session history.
+- Web: `openSession`/`openChat` work (`openChat` with the model's capabilities); a cancelled stream stops its call.
+- Require `flutter_edge_ai` ^2.6.0.
+
+## 1.2.6
+- Require `flutter_edge_ai` >=2.3.0 <2.6.0.
+
+## 1.2.5
+- MediaPipe GenAI 0.10.35 on Android and iOS, 0.10.30 on the web.
+- Web: a multi-turn chat keeps the model's replies; each turn resends the conversation (#705).
+
+## 1.2.4
+- Web: the vision warning appears only for a model created without `supportImage` (#719).
+
+## 1.2.3
+- README: `flutter_edge_ai_llama` needs iOS 16.4.
+
+## 1.2.2
+- Require `flutter_edge_ai` ^2.3.0 (imports its engine library).
+
+## 1.2.1
+- `close()` sets `isClosed` at once and releases the native model before its listeners fire.
+- Require `flutter_edge_ai` ^2.2.1.
+
+## 1.2.0
+- Unset sampling uses the model family defaults, top-k at most 40, instead of greedy (#572).
+- Require `flutter_edge_ai` ^2.2.0.
+
+## 1.1.1
+- Android: destroying the activity mid-generation no longer crashes the app (#590).
+
+## 1.1.0
+- **Breaking:** `createChat(isThinking:)` is `enableThinking`; require `flutter_edge_ai` ^2.1.0.
+
+## 1.0.9
+- Require `flutter_edge_ai` 2.x.
+
+## 1.0.8
+- Renamed from `flutter_gemma_mediapipe`.
+- Web loads the GenAI WASM from `@mediapipe/tasks-genai` 0.10.29.
+
+## 1.0.7
+- README: the Android dependency is `com.google.mediapipe:tasks-genai`.
+
+## 1.0.6
+- Fix Android release builds failing in R8 on classes MediaPipe references but does not ship (#514).
+
+## 1.0.5
+- Android plugin no longer applies KGP — Flutter's Gradle plugin does (#440).
+- fix: await the session future inside its try block on web, so the catch can see its errors.
+
+## 1.0.4
+- Fix AGP 9 build on `android.builtInKotlin=false` — apply KGP unless built-in Kotlin is on, so the plugin's Kotlin compiles (#360).
+
+## 1.0.3
+- Migrate Android module to Built-in Kotlin — apply KGP only on AGP < 9, ready for AGP 9+ (#323).
+
+## 1.0.2
+- Accept `maxOutputTokens` (session + chat) for interface parity; MediaPipe has no output cap, so it's logged + ignored (#318).
+
+## 1.0.1
+- Point `homepage` to fluttergemma.dev. No code change.
+
+## 1.0.0
+- Stable 1.0.0; spec imports redirected off the `dart:io` mobile lib for a wasm-clean web graph.
+
+## 1.0.0-rc.1
+- Initial release: MediaPipe (`.task` / `.bin`) on-device inference engine for flutter_gemma.
+- Provides `MediaPipeEngine` (InferenceEngineProvider); bundles Google's MediaPipe Pod/Gradle deps.
+- Android, iOS, Web (`@mediapipe/tasks-genai` CDN). No desktop (use flutter_gemma_litertlm).

@@ -1,0 +1,393 @@
+import 'dart:async';
+import 'dart:typed_data';
+
+import 'package:flutter_edge_ai/flutter_edge_ai.dart'
+    show
+        InferenceChat,
+        Message,
+        ModelResponse,
+        SpeechRecognizer,
+        SpeechSynthesizer,
+        TextResponse,
+        ThinkingResponse,
+        FunctionCallResponse,
+        Tool;
+import 'package:flutter_edge_ai_speech/src/voice/pcm_wav.dart';
+import 'package:flutter_edge_ai_speech/src/voice/voice_event.dart'
+    show VoiceReplyTextEvent;
+import 'package:flutter_edge_ai_speech/src/voice/voice_session.dart';
+import 'package:flutter_test/flutter_test.dart';
+
+import 'support/noop_session.dart';
+
+class _NoopRecognizer implements SpeechRecognizer {
+  @override
+  String? language;
+
+  @override
+  Future<String> transcribe(Uint8List pcm, {String? language}) async => '';
+  @override
+  void addCloseListener(void Function() l) {}
+  @override
+  Future<void> close() async {}
+}
+
+/// Fixed transcript so a turn actually runs.
+class _FixedRecognizer implements SpeechRecognizer {
+  @override
+  String? language;
+
+  @override
+  Future<String> transcribe(Uint8List pcm, {String? language}) async => 'hi';
+  @override
+  void addCloseListener(void Function() l) {}
+  @override
+  Future<void> close() async {}
+}
+
+/// Scripts one `generateChatResponseAsync` turn per entry (falls back to a
+/// 'done' text turn), so the real `generateChatResponseWithTools` loop can be
+/// driven through `VoiceSession.fromChat` without a native session.
+class _ScriptChat extends InferenceChat {
+  _ScriptChat(List<List<ModelResponse>> turns, {bool supportAudio = false})
+    : this._(_Turns(turns), supportAudio: supportAudio);
+
+  _ScriptChat._(this._script, {super.supportAudio})
+    : super(
+        sessionCreator: null,
+        maxTokens: 1024,
+        tools: const [Tool(name: 'get_time', description: 't')],
+        turnHooks: ScriptedTurnHooks(_script.next),
+      ) {
+    session = NoopSession();
+  }
+
+  final _Turns _script;
+  int get generations => _script.generations;
+  final List<Message> received = [];
+
+  @override
+  Future<void> addQueryChunk(
+    Message m, [
+    bool noTool = false,
+    bool prefix = false,
+  ]) async => received.add(m);
+
+  @override
+  Future<void> stopGeneration() async {}
+  @override
+  Future<void> close() async {}
+}
+
+class _NoopSynth implements SpeechSynthesizer {
+  @override
+  int get sampleRate => 22050;
+  @override
+  Future<Uint8List> synthesize(String t) async => Uint8List(0);
+  @override
+  void addCloseListener(void Function() l) {}
+  @override
+  Future<void> close() async {}
+}
+
+void main() {
+  test('fromChat with a tools-chat but no onToolCall throws', () {
+    final chatWithTools = InferenceChat(
+      sessionCreator: null,
+      maxTokens: 1024,
+      tools: const [Tool(name: 'noop', description: 'noop')],
+    );
+    expect(
+      () => VoiceSession.fromChat(
+        recognizer: _NoopRecognizer(),
+        chat: chatWithTools,
+        synthesizer: _NoopSynth(),
+      ),
+      throwsArgumentError,
+    );
+  });
+
+  test('fromChat with a tools-chat AND onToolCall builds a session', () {
+    final chatWithTools = InferenceChat(
+      sessionCreator: null,
+      maxTokens: 1024,
+      tools: const [Tool(name: 'noop', description: 'noop')],
+    );
+    final session = VoiceSession.fromChat(
+      recognizer: _NoopRecognizer(),
+      chat: chatWithTools,
+      synthesizer: _NoopSynth(),
+      onToolCall: (c) async => {'result': 'ok'},
+    );
+    expect(session, isA<VoiceSession>());
+  });
+
+  test('fromChat builds a session when the chat is tools-free', () {
+    final chat = InferenceChat(sessionCreator: null, maxTokens: 1024);
+    final session = VoiceSession.fromChat(
+      recognizer: _NoopRecognizer(),
+      chat: chat,
+      synthesizer: _NoopSynth(),
+    );
+    expect(session, isA<VoiceSession>());
+    expect(session.replySampleRate, 22050);
+  });
+
+  test(
+    'fromChat tools path: runTurn invokes onToolCall and surfaces the reply',
+    () async {
+      final chat = _ScriptChat([
+        const [FunctionCallResponse(name: 'get_time', args: {})],
+        const [TextResponse('done')],
+      ]);
+      var called = false;
+      final session = VoiceSession.fromChat(
+        recognizer: _FixedRecognizer(),
+        chat: chat,
+        synthesizer: _NoopSynth(),
+        onToolCall: (c) {
+          called = true;
+          return {'result': 'x'};
+        },
+      );
+
+      final events = await session.runTurn(Uint8List(0)).toList();
+
+      expect(
+        called,
+        isTrue,
+        reason: 'onToolCall must fire on the function call',
+      );
+      final reply = events
+          .whereType<VoiceReplyTextEvent>()
+          .map((e) => e.chunk)
+          .join();
+      expect(
+        reply,
+        'done',
+        reason: 'the post-tool answer must surface as reply text',
+      );
+      expect(
+        chat.generations,
+        2,
+        reason: 'one generation for the call, one for the answer',
+      );
+    },
+  );
+
+  test(
+    'fromChat tools path: interrupt() halts the loop before the next generation',
+    () async {
+      final chat = _ScriptChat([
+        const [FunctionCallResponse(name: 'get_time', args: {})],
+        const [TextResponse('unreachable')], // 2nd generation must NOT run
+      ]);
+      final toolFired = Completer<void>();
+      final letToolReturn = Completer<void>();
+      final session = VoiceSession.fromChat(
+        recognizer: _FixedRecognizer(),
+        chat: chat,
+        synthesizer: _NoopSynth(),
+        onToolCall: (c) async {
+          if (!toolFired.isCompleted) toolFired.complete();
+          await letToolReturn.future; // hang the tool mid-turn
+          return {'result': 'x'};
+        },
+      );
+
+      final events = session.runTurn(Uint8List(0)).toList();
+      await toolFired.future; // the tool is now running (turn in flight)
+      final interrupting = session.interrupt(); // cancels this turn's token
+      letToolReturn.complete(); // tool returns; loop then sees the cancel
+      await interrupting;
+      await events;
+
+      expect(
+        chat.generations,
+        1,
+        reason:
+            'barge-in must stop the tool loop before the 2nd generation; '
+            'the per-turn cancel token propagates to generateChatResponseWithTools',
+      );
+    },
+  );
+
+  test('textTokensOf keeps only TextResponse tokens, in order', () async {
+    Stream<ModelResponse> responses() async* {
+      yield const ThinkingResponse('...thinking...');
+      yield const TextResponse('Hello');
+      yield const FunctionCallResponse(name: 'x', args: {});
+      yield const TextResponse(' world');
+    }
+
+    final tokens = await VoiceSession.textTokensOf(responses()).toList();
+    expect(tokens, ['Hello', ' world']);
+  });
+
+  group('fromChat and audio turns', () {
+    test(
+      'a chat with supportAudio hears the recording as a WAV, no text',
+      () async {
+        final chat = _AudioChat(supportAudio: true);
+        final session = VoiceSession.fromChat(
+          recognizer: _NoopRecognizer(),
+          chat: chat,
+          synthesizer: _NoopSynth(),
+        );
+        final pcm = Uint8List.fromList([1, 0, 2, 0]);
+
+        final events = await session.runAudioTurn(pcm).toList();
+
+        final message = chat.received.single;
+        expect(message.isUser, isTrue);
+        expect(message.text, isEmpty);
+        _expectWav16kMono(message.audioBytes!, pcm);
+        expect(events.whereType<VoiceReplyTextEvent>().map((e) => e.chunk), [
+          'Paris',
+        ]);
+      },
+    );
+
+    test('a tools chat runs the tool loop on the recording', () async {
+      final chat = _ScriptChat([
+        [const FunctionCallResponse(name: 'get_time', args: {})],
+        [const TextResponse('noon')],
+      ], supportAudio: true);
+      final calls = <String>[];
+      final session = VoiceSession.fromChat(
+        recognizer: _NoopRecognizer(),
+        chat: chat,
+        synthesizer: _NoopSynth(),
+        onToolCall: (call) async {
+          calls.add(call.name);
+          return {'time': '12:00'};
+        },
+      );
+      final pcm = Uint8List.fromList([3, 0, 4, 0]);
+
+      final events = await session.runAudioTurn(pcm).toList();
+
+      expect(calls, ['get_time']);
+      _expectWav16kMono(chat.received.first.audioBytes!, pcm);
+      expect(chat.received.skip(1).where((m) => m.audioBytes != null), isEmpty);
+      expect(events.whereType<VoiceReplyTextEvent>().map((e) => e.chunk), [
+        'noon',
+      ]);
+    });
+
+    test(
+      'an interrupt right after listen runs no tool and asks no model',
+      () async {
+        final chat = _ScriptChat([
+          [const FunctionCallResponse(name: 'get_time', args: {})],
+          [const TextResponse('noon')],
+        ], supportAudio: true);
+        final calls = <String>[];
+        final session = VoiceSession.fromChat(
+          recognizer: _NoopRecognizer(),
+          chat: chat,
+          synthesizer: _NoopSynth(),
+          onToolCall: (call) async {
+            calls.add(call.name);
+            return {'time': '12:00'};
+          },
+        );
+        final events = <Object>[];
+        session
+            .runAudioTurn(Uint8List.fromList([3, 0, 4, 0]))
+            .listen(events.add);
+        await session.interrupt();
+        // Let a detached reply, if one started, run its tool loop.
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+
+        expect(calls, isEmpty);
+        expect(chat.generations, 0);
+        expect(chat.received, isEmpty);
+      },
+    );
+
+    test('a chat without supportAudio cannot run an audio turn', () {
+      final session = VoiceSession.fromChat(
+        recognizer: _NoopRecognizer(),
+        chat: _AudioChat(supportAudio: false),
+        synthesizer: _NoopSynth(),
+      );
+      expect(() => session.runAudioTurn(Uint8List(4)), throwsStateError);
+    });
+
+    test('wavFromPcm16kMono writes a 16 kHz mono PCM16 RIFF header', () {
+      final pcm = Uint8List.fromList(List.filled(6, 7));
+      _expectWav16kMono(wavFromPcm16kMono(pcm), pcm);
+    });
+  });
+}
+
+/// [wav] is [pcm] in a canonical 44-byte RIFF header for 16 kHz mono 16-bit
+/// PCM. The expected values are literals, not the writer's own output.
+void _expectWav16kMono(Uint8List wav, Uint8List pcm) {
+  final header = ByteData.sublistView(wav, 0, 44);
+  String ascii(int at) => String.fromCharCodes(wav.sublist(at, at + 4));
+
+  expect(wav.length, 44 + pcm.length);
+  expect(ascii(0), 'RIFF');
+  expect(header.getUint32(4, Endian.little), 36 + pcm.length);
+  expect(ascii(8), 'WAVE');
+  expect(ascii(12), 'fmt ');
+  expect(header.getUint32(16, Endian.little), 16); // fmt chunk size
+  expect(header.getUint16(20, Endian.little), 1); // PCM
+  expect(header.getUint16(22, Endian.little), 1); // mono
+  expect(header.getUint32(24, Endian.little), 16000);
+  expect(header.getUint32(28, Endian.little), 32000); // byte rate
+  expect(header.getUint16(32, Endian.little), 2); // block align
+  expect(header.getUint16(34, Endian.little), 16);
+  expect(ascii(36), 'data');
+  expect(header.getUint32(40, Endian.little), pcm.length);
+  expect(wav.sublist(44), pcm);
+}
+
+/// One scripted turn per generation; a 'done' text turn past the script.
+class _Turns {
+  _Turns(this._turns);
+
+  final List<List<ModelResponse>> _turns;
+  int _i = 0;
+  int generations = 0;
+
+  Stream<ModelResponse> next() async* {
+    generations++;
+    final turn = _i < _turns.length
+        ? _turns[_i++]
+        : const <ModelResponse>[TextResponse('done')];
+    for (final r in turn) {
+      yield r;
+    }
+  }
+}
+
+/// A tools-free chat that records what it is fed and answers 'Paris'.
+class _AudioChat extends InferenceChat {
+  _AudioChat({required super.supportAudio})
+    : super(
+        sessionCreator: null,
+        maxTokens: 1024,
+        turnHooks: ScriptedTurnHooks(
+          () => Stream.value(const TextResponse('Paris')),
+        ),
+      ) {
+    session = NoopSession();
+  }
+
+  final List<Message> received = [];
+
+  @override
+  Future<void> addQueryChunk(
+    Message m, [
+    bool noTool = false,
+    bool prefix = false,
+  ]) async => received.add(m);
+
+  @override
+  Future<void> stopGeneration() async {}
+  @override
+  Future<void> close() async {}
+}

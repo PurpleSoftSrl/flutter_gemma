@@ -1,0 +1,345 @@
+// A fake ORT-GenAI worker — a REAL isolate, REAL ports, ZERO FFI. It runs the
+// production worker loop (`serveGenAiWorker`, `lib/src/ffi/gen_ai_worker.dart`)
+// over a scripted [GenAiWorkerEngine], so `test/gen_ai_client_lifecycle_test.dart`
+// can inject it via `GenAiFfiClient(workerEntry: fakeGenAiWorkerEntry)` and
+// exercise the REAL client's dispatch/mutex/`_closed`-recheck machinery AND
+// the real worker's queue/stop/close rules end-to-end (hardened plan Task
+// 2b/2c) — something a `FakeGenAiClient`-based session test cannot reach,
+// since that fake skips `GenAiFfiClient` entirely. This fake has NO FFI and
+// no native pointers, so it cannot prove that the FFI engine's native handle
+// teardown is use-after-free-safe — see `onnx_generation_host_smoke_test.dart`
+// for that.
+//
+// A call that must be held — a native call that has not returned yet —
+// blocks on a gate: it waits, without yielding, until the file
+// `<log>.release` exists. The test creates that file when it is ready, so the
+// order of events is fixed by the test, not by how fast the machine is. A
+// gate gives up on its own after 30 s, so a failing test never leaves a
+// worker blocked for good.
+//
+// Engine configuration — the `modelDir` passed to `GenAiFfiClient.load` —
+// is JSON when the test needs it, or a directory whose `fake_config.json`
+// holds that JSON (a directory the test can also put a `tokenizer.json` in);
+// anything else means the defaults:
+//   {"log": "/tmp/x.log", "failLoad": true, "throwOnClose": true}
+// - `log`: the engine appends one line per call (`load`, `generate`,
+//   `count`, `reset`, `close`, `tail` for a turn's last call, and how an
+//   `untilStopped` turn ended) to this file — the only way the test, on the
+//   main isolate, can see what ran inside the worker. The writes are
+//   synchronous, so a line can be read before the call returns. They are not
+//   fsync'd: the test reads them from the same machine's page cache, and an
+//   fsync makes every logged call wait for the disk — up to half a second a
+//   call in a Linux VM with another process writing (measured), the worker
+//   blocked and deaf to the client meanwhile. Gates use `<log>.release`.
+// - `failLoad`: `load` throws after it "allocated" something.
+// - `gateLoad`: `load` blocks on the gate.
+// - `gateClose`: `close` blocks on the gate before it logs.
+// - `throwOnClose`: `close` throws.
+// - `gateReset`: `resetGenerator` logs, then blocks on the gate.
+// - `throwOnReset`: `resetGenerator` throws.
+// - `killOnReset`: `resetGenerator` kills the isolate.
+// - `dieAfterMs`: the isolate kills itself this long after load, with nothing
+//   in flight — a worker that dies while idle.
+//
+// Turn script — [GenAiTurn.userContent] — is JSON too (falls back to a single
+// verbatim echo chunk if it doesn't parse):
+//   {"chunks": ["a", "b"], "delayMs": 10, "echoIsFirstTurn": true}
+// - `chunks`: pieces emitted in order, one per (simulated) decode step.
+// - `delayMs`: real-clock delay before each chunk (0 = yield-only, still
+//   enough for a queued StopSignal to land between chunks — mirrors the
+//   real engine's per-token yield).
+// - `echoIsFirstTurn`: when true, a marker chunk `[isFirstTurn=<bool>]` is
+//   sent FIRST, echoing what the worker received on [GenAiTurn.isFirstTurn]
+//   — lets a test assert the client-observable effect of `resetSession()`
+//   without reaching into worker-private state.
+// - `echoSession`: when true, a marker chunk `[session=<id> turn=<n>]` is sent
+//   first: the session the turn ran on and how many turns that session has had
+//   since its generator was last reset (the fake's per-session "KV cache").
+// - `gate`: blocks on the gate before the first chunk — a prompt's prefill,
+//   one native call nothing can interrupt.
+// - `gateAtTail`: once the chunks are done, logs `tail` and blocks on the
+//   gate before the turn returns — a last native call, during which the test
+//   sends what it wants queued behind the turn.
+// - `untilStopped`: after the chunks, yields until a stop is requested and
+//   logs `stopped`, so the turn ends only when something stops it. After
+//   30 s without one it logs `deadline` and returns instead — a stop that
+//   never arrived, which a test can then tell apart from one that did.
+// - `kill`: when true, the isolate kills ITSELF (`Isolate.current.kill`)
+//   instead of ever replying — simulates an unexpected native crash
+//   mid-generation. Never sends a Chunk/GenerateDone.
+// - `crash`: when true, an uncaught error takes the isolate down at the
+//   turn's first yield — a death mid-turn that reports its reason.
+// - `throw`: when true, the turn throws — a native call that failed.
+// - `throwUnprintable`: the turn throws an error whose `toString` throws, so
+//   serving it fails and the serving loop itself throws.
+// - `end`: the name of the [TurnEnd] a turn that ran its chunks reports
+//   (default `endOfSequence`); a turn a stop cut short reports `stopped`.
+// - `contextFull`: the turn throws [GenAiContextFullException] before its
+//   first chunk — a prompt that does not fit.
+// After every turn the worker settles it (unless it is closing): with
+// `logSettle: true` in the engine configuration the engine logs
+// `settle:<session>:<keep|keepStopped|keepCut|rewind>`. A rewind takes the
+// turn back off the session's turn count (`echoSession`), while keepCut, like
+// keep, leaves it on, and keepStopped does unless the turn emitted no chunk; a turn that threw before its "prefill" (`contextFull`) counts
+// as not run.
+// A guided turn whose session has no "generator" yet (its first turn, or the
+// first after a reset) logs `guidance:<session>:<schema>`: the schema the
+// generator would be created with.
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+import 'dart:isolate';
+
+import 'package:flutter_edge_ai/engine.dart' show TurnEnd;
+import 'package:flutter_edge_ai_onnx/src/ffi/gen_ai_client.dart';
+import 'package:flutter_edge_ai_onnx/src/ffi/gen_ai_protocol.dart';
+import 'package:flutter_edge_ai_onnx/src/ffi/gen_ai_worker.dart';
+
+Future<void> fakeGenAiWorkerEntry(WorkerInit init) =>
+    serveGenAiWorker(init, _ScriptedEngine(init.modelDir));
+
+/// Reads [json] as a JSON object, or null when it is not one.
+Map<String, dynamic>? _objectOrNull(String json) {
+  try {
+    final decoded = jsonDecode(json);
+    return decoded is Map<String, dynamic> ? decoded : null;
+  } on FormatException {
+    return null;
+  }
+}
+
+/// An error whose `toString` throws: serving it as a reply throws too.
+class _UnprintableError {
+  @override
+  String toString() =>
+      throw StateError('fake error that cannot describe itself');
+}
+
+class _ScriptedEngine implements GenAiWorkerEngine {
+  _ScriptedEngine(String modelDir) : _config = _configOf(modelDir);
+
+  static Map<String, dynamic> _configOf(String modelDir) {
+    final file = File('$modelDir/fake_config.json');
+    if (file.existsSync()) return _objectOrNull(file.readAsStringSync()) ?? {};
+    return _objectOrNull(modelDir) ?? {};
+  }
+
+  final Map<String, dynamic> _config;
+
+  /// Turns each session has had since its generator was last reset; the
+  /// stand-in for a per-session KV cache.
+  final Map<int?, int> _turns = {};
+
+  String? get _logPath => _config['log'] as String?;
+
+  void _log(String line) {
+    final path = _logPath;
+    if (path == null) return;
+    File(path).writeAsStringSync('$line\n', mode: FileMode.append);
+  }
+
+  /// Blocks this isolate — no events, no microtasks — until the test creates
+  /// `<log>.release`, the way a synchronous native call does.
+  void _blockUntilReleased() {
+    final release = File('$_logPath.release');
+    final deadline = DateTime.now().add(const Duration(seconds: 30));
+    while (!release.existsSync()) {
+      if (DateTime.now().isAfter(deadline)) {
+        throw StateError('fake gate was never released');
+      }
+      sleep(const Duration(milliseconds: 5));
+    }
+  }
+
+  @override
+  Future<void> load() async {
+    _log('load');
+    if (_config['failLoad'] == true) {
+      throw StateError('fake GenAI engine refused to load');
+    }
+    if (_config['gateLoad'] == true) _blockUntilReleased();
+    final dieAfterMs = _config['dieAfterMs'];
+    if (dieAfterMs is num) {
+      Timer(
+        Duration(milliseconds: dieAfterMs.toInt()),
+        () => Isolate.current.kill(priority: Isolate.immediate),
+      );
+    }
+  }
+
+  @override
+  Future<GenAiTurnResult> generate(
+    GenAiTurn turn, {
+    String? guidance,
+    List<Map<String, String>>? seedHistory,
+    required void Function(String piece) emit,
+    required bool Function() stopRequested,
+  }) async {
+    _log(turn.sessionId == null ? 'generate' : 'generate:${turn.sessionId}');
+    if (turn.isFirstTurn) {
+      _turns.remove(turn.sessionId);
+      _generators.remove(turn.sessionId);
+    }
+    if (_generators.add(turn.sessionId) && guidance != null) {
+      _log('guidance:${turn.sessionId}:$guidance');
+    }
+    final turnNumber = _turns[turn.sessionId] =
+        (_turns[turn.sessionId] ?? 0) + 1;
+    final script = _objectOrNull(turn.userContent);
+    if (script != null && script['kill'] == true) {
+      // Simulate an unexpected native crash: the isolate dies while a
+      // request is in flight, never sending a reply — what the client's
+      // `onExit` handling (`_dispatch`'s `msg == null` branch) is built for.
+      Isolate.current.kill(priority: Isolate.immediate);
+      // Unreachable in practice — kill() terminates before this returns —
+      // but the function must still return on every path.
+      return const GenAiTurnResult(
+        GenAiGenerationStats(promptTokens: 0, generatedTokens: 0, decodeMs: 0),
+        TurnEnd.closed,
+      );
+    }
+    final chunks = script == null
+        ? [turn.userContent]
+        : (script['chunks'] as List? ?? const []).cast<String>();
+    final delayMs = (script?['delayMs'] as num?)?.toInt() ?? 0;
+
+    if (script?['gate'] == true) _blockUntilReleased();
+    if (script?['throw'] == true) {
+      throw StateError('fake generation failed');
+    }
+    if (script?['throwUnprintable'] == true) throw _UnprintableError();
+    if (script?['contextFull'] == true) {
+      // Nothing reached the "generator": undo the count this turn took.
+      final turns = _turns[turn.sessionId]! - 1;
+      if (turns == 0) {
+        _turns.remove(turn.sessionId);
+      } else {
+        _turns[turn.sessionId] = turns;
+      }
+      throw const GenAiContextFullException('fake prompt does not fit');
+    }
+    _ran[turn.sessionId] = true;
+    _emitted[turn.sessionId] = 0;
+    if (script?['crash'] == true) {
+      scheduleMicrotask(() => throw StateError('fake native crash'));
+    }
+
+    var generated = 0;
+    if (script?['echoSession'] == true) {
+      // A generator per session: the count is how many turns this session has
+      // had since its last reset, so it shows whose context a turn ran on.
+      emit('[session=${turn.sessionId} turn=$turnNumber]');
+      generated++;
+    }
+    if (script?['echoIsFirstTurn'] == true) {
+      emit('[isFirstTurn=${turn.isFirstTurn}]');
+      generated++;
+    }
+
+    var stopped = false;
+    for (final chunk in chunks) {
+      if (delayMs > 0) {
+        await Future<void>.delayed(Duration(milliseconds: delayMs));
+      } else {
+        // Yield-only pacing still gives a queued StopSignal a chance to
+        // interleave, same shape as the real engine's `await Future(() {})`.
+        await Future<void>(() {});
+      }
+      if (stopRequested()) {
+        stopped = true;
+        break;
+      }
+      emit(chunk);
+      _emitted[turn.sessionId] = (_emitted[turn.sessionId] ?? 0) + 1;
+      generated++;
+    }
+
+    if (script?['untilStopped'] == true) {
+      final deadline = DateTime.now().add(const Duration(seconds: 30));
+      while (!stopRequested() && DateTime.now().isBefore(deadline)) {
+        await Future<void>(() {});
+      }
+      stopped = stopRequested();
+      _log(stopped ? 'stopped' : 'deadline');
+    }
+
+    if (script?['gateAtTail'] == true) {
+      _log('tail');
+      _blockUntilReleased();
+    }
+
+    final scriptedEnd = script?['end'];
+    return GenAiTurnResult(
+      GenAiGenerationStats(
+        promptTokens: chunks.length,
+        generatedTokens: generated,
+        decodeMs: generated,
+      ),
+      stopped
+          ? TurnEnd.stopped
+          : scriptedEnd is String
+          ? TurnEnd.values.byName(scriptedEnd)
+          : TurnEnd.endOfSequence,
+    );
+  }
+
+  @override
+  bool endTurn({int? sessionId, required AfterTurn how}) {
+    if (_config['logSettle'] == true) _log('settle:$sessionId:${how.name}');
+    final ran = _ran.remove(sessionId) ?? false;
+    final emitted = _emitted.remove(sessionId) ?? 0;
+    final turns = _turns[sessionId];
+    // As the real engine: a stop that streamed no text is rewound.
+    final rewound =
+        how == AfterTurn.rewind ||
+        (how == AfterTurn.keepStopped && emitted == 0);
+    if (rewound && ran && turns != null) {
+      if (turns <= 1) {
+        _turns.remove(sessionId);
+      } else {
+        _turns[sessionId] = turns - 1;
+      }
+    }
+    return true;
+  }
+
+  /// Chunks the last turn of each session emitted.
+  final Map<int?, int> _emitted = {};
+
+  /// Sessions with a "generator": created by a turn, gone at a reset.
+  final Set<int?> _generators = {};
+
+  /// Sessions whose last turn got past its "prefill".
+  final Map<int?, bool> _ran = {};
+
+  @override
+  int countTokens(String text) {
+    _log('count');
+    // Deterministic zero-native token count — good enough for lifecycle
+    // assertions, which only care about the reply round-tripping.
+    return (text.length / 4).ceil();
+  }
+
+  @override
+  void resetGenerator({int? sessionId}) {
+    _turns.remove(sessionId);
+    _generators.remove(sessionId);
+    _log(sessionId == null ? 'reset' : 'reset:$sessionId');
+    if (_config['gateReset'] == true) _blockUntilReleased();
+    if (_config['killOnReset'] == true) {
+      Isolate.current.kill(priority: Isolate.immediate);
+    }
+    if (_config['throwOnReset'] == true) {
+      throw StateError('fake generator reset blew up');
+    }
+  }
+
+  @override
+  void close() {
+    if (_config['gateClose'] == true) _blockUntilReleased();
+    _log('close');
+    if (_config['throwOnClose'] == true) {
+      throw StateError('fake GenAI close blew up');
+    }
+  }
+}

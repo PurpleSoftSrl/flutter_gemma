@@ -1,0 +1,177 @@
+---
+name: flutter-edge-ai-function-calling
+description: Use when adding function calling (tool calling) to a flutter_edge_ai chat — letting an on-device model call the app's own Dart functions, declaring Tool objects, handling FunctionCallResponse or ParallelFunctionCallResponse, returning results with Message.toolResponse, or running the built-in tool loop generateChatResponseWithTools. Also use when the model describes an action in prose instead of calling the tool, raw tool-call markers appear in the reply text, or a switch over ModelResponse fails to compile. For plain chat, use flutter-edge-ai-inference. Not for flutter_edge_ai_agent, which gives the on-device model SKILL.md skills of its own.
+---
+
+# Function calling with flutter_edge_ai
+
+Packages, engine and model install are in the flutter-edge-ai-inference skill. This one starts from a loaded `InferenceModel`.
+
+## Rules
+
+1. `openChat` needs `tools` and `supportsFunctionCalls: true`. Without the flag no call is parsed and only a debug warning is logged — and on `.litertlm` with Gemma 4 or FunctionGemma the declarations still reach the SDK, so the model answers with raw tool-call JSON inside the text stream.
+2. `openChat` on native LiteRT-LM, MediaPipe Android/iOS/Web, built-in AI, native/web ONNX and llama.cpp takes the installed model's type when it is omitted. LiteRT-LM Web still uses core's Gemma default, so pass `modelType` there or another model's calls arrive as raw text. On `flutter_edge_ai_llama`, the GGUF chat template parses calls itself; `modelType` only selects sampling defaults, and tools are enabled unless `supportsFunctionCalls: false`.
+3. Switch over all four `ModelResponse` subtypes. It is sealed — a switch that leaves out `ThinkingResponse` does not compile.
+4. Return tool results as data, errors included. Never throw from a tool.
+5. Prefer `generateChatResponseWithTools` to a hand-written loop.
+6. Use a model that can call tools (https://flutteredge.ai/docs/models):
+   Gemma 4, FunctionGemma, Phi-4 Mini, Qwen 2.5, Qwen3, DeepSeek R1,
+   Gemma 3n E4B `.litertlm`, or the OS built-in model. Gemma 3 1B, Gemma 3
+   270M, SmolLM, SmolLM3, LFM2.5, Phi-4 Mini Reasoning and the vision models
+   (FastVLM, Qwen2-VL, SmolVLM2, LLaVA-OneVision) cannot — they describe the
+   action in prose instead. A GGUF model through `flutter_edge_ai_llama` can
+   call tools when its chat template supports them.
+9. Never combine tools with `responseFormat`. `openChat(tools: ..., responseFormat: ...)` throws `ArgumentError` before the engine is called because a tool call is not a value of the requested format. Use a separate structured chat/session for the final typed answer, or request JSON in the prompt and validate it in the app.
+
+## Declare a tool
+
+`parameters` is a JSON Schema object. The model matches the user's intent against `description`, so write it as an action and describe every parameter.
+
+```dart
+import 'package:flutter_edge_ai/flutter_edge_ai.dart';
+
+const changeColor = Tool(
+  name: 'change_color',
+  description: 'Change the app background colour.',
+  parameters: {
+    'type': 'object',
+    'properties': {
+      'color': {'type': 'string', 'description': 'A colour name, e.g. red.'},
+    },
+    'required': ['color'],
+  },
+);
+```
+
+## Open the chat
+
+```dart
+final InferenceChat chat = await model.openChat(
+  tools: myTools,
+  supportsFunctionCalls: true,
+  modelType: ModelType.gemma4,
+);
+```
+
+## The built-in loop
+
+It calls the handler for each tool call, feeds the result back, and continues until the model answers in text or `maxToolTurns` is reached.
+
+```dart
+try {
+  await chat.addQueryChunk(Message(text: prompt, isUser: true));
+  final answer = StringBuffer();
+  await for (final r in chat.generateChatResponseWithTools(
+    onToolCall: (FunctionCallResponse call) {
+      answer.clear(); // text streamed before a call is not the answer
+      return runTool(call.name, call.args);
+    },
+    maxToolTurns: 8,
+    onMaxToolTurns: () => print('stopped after 8 tool turns'),
+  )) {
+    if (r is TextResponse) answer.write(r.token);
+  }
+} finally {
+  await chat.close();
+}
+```
+
+Gemma 4 often writes a sentence, then calls a tool. The sentence streams as `TextResponse`, so the snippet clears the buffer when a call arrives, as `flutter_edge_ai_agent` does; the chat's history keeps only the call (its `tool_calls` objects), not the sentence. Without `supportsFunctionCalls: true`, or with `toolChoice: ToolChoice.none`, the call's JSON stays in the text instead.
+
+`onToolCall` receives a `FunctionCallResponse` with `name` and `args`, and returns the map the model reads back. `args` keeps the JSON types the model wrote — numbers, booleans, null, nested maps and lists, not only strings — so read a number as `num`. Its `id` is null on the `.litertlm`, MediaPipe, ONNX and built-in AI engines; `flutter_edge_ai_llama` gives every call one, and genai `callId`s and Genkit `ref`s carry theirs. The stream carries `TextResponse` and `ThinkingResponse`. Reaching `maxToolTurns` ends the stream without an error — `onMaxToolTurns` is the only signal. An exception from `onToolCall` is answered to the model as `{"error": …}`, and a result `jsonEncode` cannot write (a `DateTime`, say) as `{"status": "ran", …}`, because the tool did run — do not run it again. The turn's other calls are answered as not run, and the error is rethrown on the stream. When an answer cannot be fed (a session closed by a barge-in), that failure is printed and the tool's own error is still the one rethrown; recreate the chat, or `clearHistory(replayHistory:)`, before the next turn.
+
+## Handling calls yourself
+
+```dart
+try {
+  final response = await chat.generateChatResponse();
+  switch (response) {
+    case FunctionCallResponse(:final name, :final args, :final id):
+      final result = await runTool(name, args);
+      await chat.addQueryChunk(
+        Message.toolResponse(toolName: name, response: result, toolCallId: id),
+      );
+      final followUp = await chat.generateChatResponse();
+    case ParallelFunctionCallResponse(:final calls):
+      for (final call in calls) {
+        final result = await runTool(call.name, call.args);
+        await chat.addQueryChunk(
+          Message.toolResponse(
+            toolName: call.name,
+            response: result,
+            toolCallId: call.id, // llama pairs by id; other engines by name, in order
+          ),
+        );
+      }
+      final afterAll = await chat.generateChatResponse();
+    case TextResponse(:final token):
+      print(token); // the model chose to answer directly — a valid outcome
+    case ThinkingResponse():
+      break;
+  }
+} finally {
+  await chat.close();
+}
+```
+
+## Calls in a history
+
+A chat records each call as `Message.toolCall(calls:)` (`flutter_edge_ai` 2.4.0): `toolCalls` holds the structured `FunctionCallResponse`s with their ids, and `text` is what text engines replay — for a `.litertlm` call, its `tool_calls` objects without the text written before them. To restore a conversation, keep both, and pair each result with its call through `toolCallId`:
+
+```dart
+const call = FunctionCallResponse(
+  name: 'change_color',
+  args: {'color': 'red'},
+  id: 'call_1',
+);
+await chat.clearHistory(replayHistory: [
+  const Message(text: 'Make it red', isUser: true),
+  Message.toolCall(calls: [call]),
+  Message.toolResponse(
+    toolName: call.name,
+    response: {'status': 'success'},
+    toolCallId: call.id,
+  ),
+]);
+```
+
+`Message.toolCall` with `calls` alone writes `text` as `{"tool_calls":[{"id","name","arguments"}]}`. Only `flutter_edge_ai_llama` reads `toolCallId` — pass it there when two calls share a name and their results go back out of order; the other engines pair a result with its call by `toolName`, in order. `MessageTranscriptCodec` saves a history with both fields and the ids as JSON (see the inference skill).
+
+## Errors are results
+
+```dart
+await chat.addQueryChunk(
+  Message.toolResponse(
+    toolName: 'change_color',
+    response: {'error': 'unknown colour: mauvish'},
+  ),
+);
+```
+
+The model can recover from an error it can read. An exception thrown out of a tool ends the turn instead.
+
+## Traps
+
+**Model answers in prose**
+- Symptom: "I would change the colour to red" instead of a call.
+- Fix: check `supportsFunctionCalls: true`, pass `modelType` on web and ONNX, then check the model is tool-capable.
+
+**Raw markers in the text**
+- Symptom: `<|tool_call>` or `<tool_call|>` appears in `TextResponse` tokens.
+- Fix: `modelType` does not match the installed model — or the call was cut off or malformed. A raw Gemma 4 call runs with its typed arguments or not at all (`flutter_edge_ai` 2.4.1): if one call of the turn does not parse in full — cut off by `maxOutputTokens`, say — none of that turn's calls runs and the text stays as it came. Raise `maxOutputTokens`.
+
+**Model calls the same tool again instead of answering the result**
+- Symptom: FunctionGemma on `.litertlm` repeats the call it just made after `Message.toolResponse`.
+- Fix: upgrade `flutter_edge_ai` and `flutter_edge_ai_litertlm` together. The
+  current renamed packages include both halves. For the legacy package names,
+  the minimum fixed pair was `flutter_gemma` 1.8.4 with
+  `flutter_gemma_litertlm` 1.7.1; older pairs send the result as an ordinary
+  user message.
+
+**Nothing after the tool result**
+- Symptom: the call arrives, the result goes back, and the stream ends with no text.
+- Fix: nothing to fix on FunctionGemma — it is an action model and ending the turn at the call is what it was trained for. Render the tool's own result, and use Gemma 4 when the model should talk about what came back.
+
+## Web
+
+Function calling works on the `.litertlm` web engine. Each `openChat` owns an independent conversation on the shared model; close every chat when done.

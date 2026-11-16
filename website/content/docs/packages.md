@@ -1,0 +1,164 @@
+---
+title: Packages
+description: Modular inference, embedding, speech, RAG orchestration, and storage packages for Flutter Edge AI.
+meta:
+  - property: og:image
+    content: https://flutteredge.ai/images/og-image.png
+---
+
+The former `flutter_gemma` monolith is now a set of opt-in modules. Core owns
+model installation plus inference, embedding, and speech registries. Since 2.0,
+RAG orchestration has its own instance-scoped package and storage providers
+depend on it. Apps ship only the runtimes and vector stores they use.
+
+## The packages
+
+| Package | What it does | Platforms |
+|---|---|---|
+| **`flutter_edge_ai`** | Core — registry, contracts, model management, sessions, chat. No engine on its own. **Required by every package except `flutter_edge_ai_diagnostics` and `genkit_hybrid`.** | All |
+| **`flutter_edge_ai_litertlm`** | `.litertlm` inference via `dart:ffi` (LiteRT-LM C API), plus `LiteRtEmbeddingBackend` for `.tflite` and EmbeddingGemma 2 embeddings. Owns the shared native library. | Mobile + Desktop + Web |
+| **`flutter_edge_ai_mediapipe`** | `.task` / `.bin` inference via MediaPipe. Google's LLM Inference API is maintenance-only — new apps should use `.litertlm`. | Mobile + Web |
+| **`flutter_edge_ai_builtin_ai`** | System OS models — Gemini Nano (Android / AICore), Apple Foundation Models (iOS 26+/macOS 26+), Windows AI Foundry (Phi Silica), and the browser Prompt API (Web — Gemini Nano in Chrome, Phi-4-mini in Edge). No model file to bundle or download. A thin adapter over [`flutter_local_ai`](https://pub.dev/packages/flutter_local_ai), which owns the native layer — not a plugin itself. | Android + iOS + macOS + Windows + Web |
+| **`flutter_edge_ai_llama`** | [GGUF inference](/docs/llama) and native EmbeddingGemma 2 text embeddings (`LlamaEmbeddingBackend`) through llamadart. Native artifacts and the Web bridge remain owned by llamadart. | Android, iOS, macOS, Windows, Linux + Web; see qualification matrix |
+| **`flutter_edge_ai_onnx`** | Text generation (`OnnxEngine`) + embeddings (`OnnxEmbeddingBackend`) — ORT-GenAI/ORT via `dart:ffi` on native, Transformers.js/onnxruntime-web on Web. | macOS arm64, Linux x64, Windows x64, Windows ARM64, Android arm64, iOS arm64 + Web |
+| **`flutter_edge_ai_embeddings`** | Embedding tokenizer implementations (Gemma SentencePiece, BERT WordPiece), registered via `embeddingTokenizers:`, for `.tflite` and `.onnx` models (an EmbeddingGemma 2 `.litertlm` carries its own). Needs a backend — `LiteRtEmbeddingBackend` (`flutter_edge_ai_litertlm`) or `OnnxEmbeddingBackend` (`flutter_edge_ai_onnx`). | All |
+| **`flutter_edge_ai_rag`** | Instance-scoped RAG orchestration, `RagIndex`, stable embedding profiles, filters, and vector-store provider contracts. | All |
+| **`flutter_edge_ai_qdrant`** | qdrant-edge provider for `flutter_edge_ai_rag`, via the official qdrant_edge UniFFI SDK. Fastest on native. | Native (no Web) |
+| **`flutter_edge_ai_sqlite`** | SQLite + `sqlite-vec` provider for `flutter_edge_ai_rag`. Exact + portable. | All (incl. Web) |
+| **`flutter_edge_ai_agent`** | On-device [agent skills](/docs/agent) — SKILL.md catalog + tool-calling loop (text / JS / native-intent / MCP). | Native, no Web (JS skills: no Linux) |
+| **`flutter_edge_ai_speech`** | On-device [speech](/docs/speech) — speech-to-text + text-to-speech + a `VoiceSession` voice loop (moonshine/Whisper/Parakeet STT + Matcha/Qwen3/Inflect TTS) via the LiteRT C API + `dart:ffi`. | Native (no Web) |
+| **`flutter_edge_ai_diagnostics`** | [Memory diagnostics](/docs/diagnostics) — the anonymous footprint (the memory the OS cannot reclaim) and the memory still available, read from the OS. No native code, no dependency on core. | Android + iOS + macOS + Linux + Windows |
+
+Which runtime gives you text generation, embeddings and speech on each platform
+is on the [Capabilities](/docs/capabilities) page.
+
+## How it works
+
+- **Core registers no AI runtime by itself.** Wire inference, embedding,
+  tokenizer, and speech packages through `FlutterEdgeAi.initialize(...)`.
+- **RAG is independently owned.** Create `FlutterEdgeAiRag(providers:)`, open
+  one or more profile-bound indexes, and dispose them before core/custom embedders.
+  See [Embeddings & RAG](/docs/embeddings-and-rag).
+- **Probe-chain registry.** Engines and backends are pure factories that declare
+  `canHandle(spec)` + a priority. The registry selects a provider per model by
+  declared `ModelFileType` — `task` / `binary` → MediaPipe, `litertlm` → LiteRT-LM,
+  `onnx` → Onnx, `builtIn` → BuiltInAi, `gguf` → the opt-in llama.cpp engine
+  (`flutter_edge_ai_llama`; see [setup](/docs/llama)).
+- **One app can run both formats.** Register both `LiteRtLmEngine()` and
+  `MediaPipeEngine()`, and the registry routes each model to the engine that
+  handles its declared `ModelFileType` — not its file extension.
+- **Shared native library.** `flutter_edge_ai_litertlm` owns the native LiteRT
+  library (fetched at build time via its Native-Assets hook), and
+  `flutter_edge_ai_speech` has no hook of its own and consumes that bundle
+  transitively. `flutter_edge_ai_embeddings` touches no native library at all. `flutter_edge_ai_onnx` owns its own separate ORT / ORT-GenAI
+  native archives.
+- **LiteRT-LM open sessions.** `openSession` / `openChat` use one native
+  conversation and KV cache per session on macOS CPU/Metal, Linux and Windows
+  CPU, Android Adreno/Mali, Qualcomm or Google Tensor NPUs on Android, and Intel
+  NPUs on Windows. Linux Vulkan, Windows D3D12, iOS, Android
+  CPU/PowerVR/MediaTek, unverified Linux arm64 accelerators and the web use
+  virtual replay.
+  Hybrid models such as LFM2 rebuild from full messages when recovery is needed
+  and never rewind. At `maxTokens: 4096`, Gemma 4 E2B measured 36.8 MiB of
+  RSS per idle native session from the third session onward on an M5 Pro; use
+  `maxConcurrentSessions` to bound the count.
+
+## Choosing packages
+
+| You want to… | Add |
+|---|---|
+| Run `.litertlm` models on any platform, desktop included (see [Models](/docs/models)) | `flutter_edge_ai_litertlm` |
+| Run `.task` / `.bin` models on mobile and web (see [Models](/docs/models)); MediaPipe is maintenance-only, so prefer `.litertlm` in new apps | `flutter_edge_ai_mediapipe` |
+| Run the OS system model with no download (Gemini Nano / Apple FM / Windows AI Foundry / the browser Prompt API) | `flutter_edge_ai_builtin_ai` |
+| Run `.gguf` inference models | `flutter_edge_ai_llama` (see [setup](/docs/llama)) |
+| Run ONNX models — ORT-GenAI (native) or Transformers.js (Web) | `flutter_edge_ai_onnx` |
+| Generate text embeddings with EmbeddingGemma 2 (`.litertlm`) | `flutter_edge_ai_litertlm` (`LiteRtEmbeddingBackend`) alone; 1.13.1 on Web |
+| Embed images with EmbeddingGemma 2 (the 440m or 740m `.litertlm`) | `flutter_edge_ai_litertlm` 1.13.1 (`LiteRtEmbeddingBackend`) alone; 1.13.1 on Web |
+| Embed audio, or several parts in one vector, with EmbeddingGemma 2 (the 740m `.litertlm`) | `flutter_edge_ai_litertlm` 1.13.1 (`LiteRtEmbeddingBackend`) with `flutter_edge_ai` 2.3.1; 1.13.2 on Web |
+| Generate text embeddings with EmbeddingGemma 2 (`.gguf`, native) | `flutter_edge_ai_llama` 0.0.3 (`LlamaEmbeddingBackend`), no tokenizer package; on iOS/macOS also `llamadart_llama_cpp_flutter`; see [llama.cpp](/docs/llama) |
+| Generate text embeddings with EmbeddingGemma 1 / Gecko (`.tflite`) | `flutter_edge_ai_embeddings` + `flutter_edge_ai_litertlm` (`LiteRtEmbeddingBackend`) |
+| Generate text embeddings from ONNX/ORT models | `flutter_edge_ai_embeddings` + `flutter_edge_ai_onnx` (`OnnxEmbeddingBackend`) |
+| On-device RAG on native, fastest (Android/iOS/desktop) | `flutter_edge_ai_rag` + `flutter_edge_ai_qdrant` |
+| On-device RAG on web, or a portable/exact store on any platform | `flutter_edge_ai_rag` + `flutter_edge_ai_sqlite` |
+| On-device agent skills the model runs itself (text / JS / native-intent / MCP) | `flutter_edge_ai_agent` |
+| Transcribe audio, synthesize speech, or run a voice loop on-device (STT + TTS + voice) | `flutter_edge_ai_speech` |
+| Measure what a model costs in memory the OS cannot reclaim (Android + iOS + macOS + Linux + Windows) | `flutter_edge_ai_diagnostics` |
+
+<Info>
+
+Desktop is served **primarily** by [`flutter_edge_ai_litertlm`](/docs/litertlm)
+(`.litertlm`). [`flutter_edge_ai_onnx`](/docs/onnx) also runs
+on macOS arm64, Windows x64 and Linux x64, [`flutter_edge_ai_llama`](/docs/llama)
+(`.gguf`) on all three desktops, and the OS built-in model is
+available via [`flutter_edge_ai_builtin_ai`](/docs/builtin-ai) on **macOS** (Apple
+Foundation Models) and on **Windows** (AI Foundry — nothing to configure to
+build: `flutter_local_ai` resolves the Windows App SDK projection itself; running
+needs Windows 11 25H2+ on Copilot+-class hardware and a packaged app); not on
+Linux. There is no MediaPipe engine on
+desktop. See [Desktop Support](/docs/desktop).
+
+</Info>
+
+See [Migration](/docs/migration) for the rename and the 2.0 extraction of RAG
+from core.
+
+## ONNX Runtime engine
+
+`flutter_edge_ai_onnx` adds a second inference/embedding stack alongside
+LiteRT-LM and MediaPipe: **ONNX Runtime** — `dart:ffi` on native (no JVM, no
+gRPC), Transformers.js / onnxruntime-web on Web. Two independent arms, either
+can be registered on its own:
+
+- **`OnnxEngine`** — text generation via [ORT-GenAI](https://github.com/microsoft/onnxruntime-genai)
+  on native, [Transformers.js](https://huggingface.co/docs/transformers.js) on
+  Web. Text-only; independent `openSession` sessions on both (native: a
+  generator each; web: each keeps its own history on the shared pipeline) —
+  no vision, no audio, no LoRA yet.
+- **`OnnxEmbeddingBackend`** — embeddings via plain ONNX Runtime
+  (WordPiece/BERT-style and SentencePiece models) on native, onnxruntime-web
+  on Web, priority 10 over `LiteRtEmbeddingBackend`'s catch-all priority 0.
+
+```dart
+import 'package:flutter_edge_ai/flutter_edge_ai.dart';
+import 'package:flutter_edge_ai_embeddings/flutter_edge_ai_embeddings.dart';
+import 'package:flutter_edge_ai_onnx/flutter_edge_ai_onnx.dart';
+
+await FlutterEdgeAi.initialize(
+  inferenceEngines: [OnnxEngine()],
+  embeddingBackends: [OnnxEmbeddingBackend()],
+  embeddingTokenizers: [GemmaEmbeddingTokenizers()], // flutter_edge_ai_embeddings
+);
+```
+
+**Platform support:** device-verified via `dart:ffi` on macOS (Apple Silicon),
+Linux x64, Windows x64, Android (arm64), and iOS (arm64). On **Web**,
+`OnnxEngine` runs generation through Transformers.js v4 and
+`OnnxEmbeddingBackend` runs through onnxruntime-web (WebGPU/WASM) — same
+public API as native, no `if (kIsWeb)` needed in app code.
+
+<Info>
+
+On native, an ORT-GenAI model installs as a **directory**, not a single file:
+`genai_config.json` + `model.onnx` (+ `model.onnx_data` for external weights)
++ tokenizer files. `fromHuggingFace(repo)` downloads the whole bundle (the ONNX
+resolver picks a CPU execution-provider folder), or ship it yourself as an asset
+/ local directory and install with `fromFile(genai_config.json)`. On **Web** this
+doesn't apply — the model is identified by its
+Hugging Face repo URL (`https://huggingface.co/onnx-community/Qwen2.5-0.5B-Instruct`),
+from which the repo id is derived, not by a directory, and install is fileless: `ModelFileType.onnx` just marks it active,
+and Transformers.js downloads and caches the repo itself.
+
+</Info>
+
+See the [`flutter_edge_ai_onnx` README](https://pub.dev/packages/flutter_edge_ai_onnx) for the full platform matrix and FFI details.
+
+## Genkit integration
+
+Two companion packages integrate flutter_edge_ai with [Genkit](https://pub.dev/packages/genkit), Google's framework for building AI features:
+
+| Package | What it does | Depends on |
+|---|---|---|
+| **`genkit_flutter_edge_ai`** | Exposes flutter_edge_ai as a Genkit model/embedder provider — call `ai.generate(model: flutterEdgeAi.model(...))` and `ai.embed(...)` through the standard Genkit API; `deciderRouteClassifier` lets a `genkit_hybrid` router decide on the device. | `flutter_edge_ai` + `genkit` + `genkit_hybrid` |
+| **`genkit_hybrid`** | Hybrid on-device/cloud routing: one decision per call, rules then a classifier, the cloud reachable only through the router. | `genkit` (+ `schemantic`); no flutter_edge_ai |
+
+See [Genkit](/docs/genkit) for setup and examples.

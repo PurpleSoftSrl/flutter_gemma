@@ -1,0 +1,401 @@
+// Member golden of the embedding SPI: what engine packages compile against.
+//
+// The symbol goldens (public_surface_test.dart) pin top-level NAMES only, so a
+// dropped parameter default, a member turned abstract or a new required named
+// parameter on `EmbeddingPassInfo` would pass them — and break, or silently
+// change, every engine built against 2.3.0. This one resolves engine.dart's
+// export namespace with the same analyzer session and renders, for each SPI
+// type, its declaration and one line per public member it declares: kind,
+// full signature (required / optional / named parameters with their
+// defaults), and the modifiers and annotations an implementer must respect
+// (`abstract`, `static`, `const`, `factory`, `@nonVirtual`, `@protected`,
+// `@Deprecated`, `@experimental`). Plus the two SPI functions' signatures.
+//
+// Chosen over member lines in the five symbol goldens: those would put every
+// exported class's members into review on unrelated changes, while this SPI is
+// the contract R5 §2.2.2 fixes member by member.
+//
+// Regenerate after an intended change (refused when CI is set):
+//   UPDATE_GOLDENS=1 flutter test test/public_surface/embedding_spi_members_test.dart
+@TestOn('vm')
+library;
+
+import 'dart:io';
+
+import 'package:analyzer/dart/element/element.dart';
+import 'package:analyzer/dart/element/nullability_suffix.dart';
+import 'package:analyzer/dart/element/type.dart';
+import 'package:flutter_test/flutter_test.dart';
+
+import 'surface_analysis.dart';
+
+/// The SPI types, in the order R5 §2.2.2 introduces them (plus the two app
+/// types an engine's describe()/fakes extend).
+const _types = [
+  'EmbeddingPass',
+  'EmbeddingPassInfo',
+  'EmbeddingPassDescriptor',
+  'TokenEmbeddingPass',
+  'TokenPassGraph',
+  'ForwardResult',
+  'EmbeddingOutputContract',
+  'EmbeddingBackendProvider',
+  'EmbeddingModel',
+];
+
+const _functions = ['finalizeEmbedding', 'meanPoolAndNormalize'];
+
+final _golden = File('test/public_surface/embedding_spi_members.golden.txt');
+
+/// The experimental Decider API, from the app library. Its promise is that a
+/// language-model decider arrives with new members only, so a member that
+/// changes here is reviewed.
+const _deciderTypes = [
+  'Decider',
+  'DeciderRequest',
+  'DeciderInput',
+  'DeciderAnswer',
+  'RankedOption',
+  'DeciderProvenance',
+  'DeciderCapabilities',
+  'ScoreKind',
+  'AbstainReason',
+  'AbstainSignalKind',
+  'DeciderQuestionType',
+  'DeciderMethod',
+  'DeciderOption',
+  'EmbeddingDeciderCalibration',
+  'InferenceDeciderCalibration',
+  'DeciderException',
+  'DeciderUnsupportedException',
+  'DeciderSpaceMismatchException',
+  'DeciderCancelledException',
+];
+
+final _deciderGolden = File('test/public_surface/decider_members.golden.txt');
+
+/// What an engine implements so that `InferenceModel.createDecider` scores
+/// options with it (engine.dart). Engines compile against it member by
+/// member, as against the embedding SPI.
+const _optionScoringTypes = [
+  'InferenceModel',
+  'OptionScorer',
+  'OptionScoringRun',
+];
+
+/// `InferenceModel` is in the option-scoring golden for its two scoring
+/// members only; the rest of it is not this SPI.
+const _optionScoringMembers = {
+  'InferenceModel': {'openOptionScorer', 'readDecisionSection'},
+};
+
+final _optionScoringGolden = File(
+  'test/public_surface/option_scoring_spi_members.golden.txt',
+);
+
+void main() {
+  test('the Decider API members match their golden', () async {
+    final namespace = await exportNamespace('flutter_edge_ai.dart');
+    expectGolden(
+      _deciderGolden,
+      _render(
+        namespace,
+        types: _deciderTypes,
+        functions: const [],
+        library: 'flutter_edge_ai.dart',
+        title: 'the experimental Decider API',
+      ),
+      (expected, actual) => describeLineDrift(
+        'The members of the Decider API in '
+        'package:flutter_edge_ai/flutter_edge_ai.dart',
+        expected,
+        actual,
+      ),
+    );
+  }, timeout: const Timeout(Duration(minutes: 5)));
+
+  test('the option-scoring SPI members match their golden', () async {
+    final namespace = await exportNamespace('engine.dart');
+    expectGolden(
+      _optionScoringGolden,
+      _render(
+        namespace,
+        types: _optionScoringTypes,
+        onlyMembers: _optionScoringMembers,
+        functions: const [],
+        library: 'engine.dart',
+        title: 'the option-scoring SPI',
+      ),
+      (expected, actual) => describeLineDrift(
+        'The members of the option-scoring SPI in '
+        'package:flutter_edge_ai/engine.dart',
+        expected,
+        actual,
+      ),
+    );
+  }, timeout: const Timeout(Duration(minutes: 5)));
+
+  test('the embedding SPI members match their golden', () async {
+    final namespace = await exportNamespace('engine.dart');
+    expectGolden(
+      _golden,
+      _render(
+        namespace,
+        types: _types,
+        functions: _functions,
+        library: 'engine.dart',
+        title: 'the embedding SPI',
+      ),
+      (expected, actual) => describeLineDrift(
+        'The members of the embedding SPI in package:flutter_edge_ai/engine.dart',
+        expected,
+        actual,
+      ),
+    );
+  }, timeout: const Timeout(Duration(minutes: 5)));
+}
+
+String _render(
+  Map<String, Element> namespace, {
+  required List<String> types,
+  Map<String, Set<String>> onlyMembers = const {},
+  required List<String> functions,
+  required String library,
+  required String title,
+}) {
+  Element find(String name) =>
+      namespace[name] ??
+      (throw StateError('$name is not exported from $library'));
+
+  final lines = <String>[
+    '# Members of $title exported by package:flutter_edge_ai/$library',
+    '# Generated by test/public_surface/embedding_spi_members_test.dart',
+    '# (UPDATE_GOLDENS=1 regenerates). One block per type: its declaration,',
+    '# then one line per public member it declares, sorted by kind and name.',
+    for (final MapEntry(key: type, value: names) in onlyMembers.entries)
+      '# $type is filtered to ${(names.toList()..sort()).join(' and ')} only.',
+  ];
+  for (final name in types) {
+    final element = find(name);
+    if (element is! InterfaceElement) {
+      throw StateError('$name is a ${element.runtimeType}, not a class/enum');
+    }
+    final only = onlyMembers[name];
+    final members = _members(element);
+    if (only != null) {
+      final rendered = {for (final m in members) m.$1};
+      final missing = only.difference(rendered);
+      if (missing.isNotEmpty) {
+        throw StateError('$name declares no member ${missing.join(', ')}');
+      }
+    }
+    lines
+      ..add('')
+      ..add(_declaration(element))
+      ..addAll([
+        for (final m in members)
+          if (only == null || only.contains(m.$1)) '  ${m.$2}',
+      ]);
+  }
+  lines.add('');
+  for (final name in functions) {
+    final element = find(name);
+    if (element is! TopLevelFunctionElement) {
+      throw StateError('$name is a ${element.runtimeType}, not a function');
+    }
+    lines.add('function ${_signature(element, element.name!)}');
+  }
+  return '${lines.join('\n')}\n';
+}
+
+String _declaration(InterfaceElement element) {
+  final parts = <String>[];
+  if (element is EnumElement) {
+    parts.add('enum ${element.name}');
+  } else if (element is ClassElement) {
+    if (element.isSealed) parts.add('sealed');
+    if (element.isAbstract && !element.isSealed) parts.add('abstract');
+    if (element.isBase) parts.add('base');
+    if (element.isInterface) parts.add('interface');
+    if (element.isFinal) parts.add('final');
+    if (element.isMixinClass) parts.add('mixin');
+    parts.add('class ${element.name}${_typeParameters(element)}');
+    final supertype = element.supertype;
+    if (supertype != null && !supertype.isDartCoreObject) {
+      parts.add('extends ${_type(supertype)}');
+    }
+  } else if (element is MixinElement) {
+    if (element.isBase) parts.add('base');
+    parts.add('mixin ${element.name}${_typeParameters(element)}');
+    if (element.superclassConstraints.isNotEmpty) {
+      parts.add('on ${element.superclassConstraints.map(_type).join(', ')}');
+    }
+  }
+  if (element.mixins.isNotEmpty) {
+    parts.add('with ${element.mixins.map(_type).join(', ')}');
+  }
+  if (element.interfaces.isNotEmpty) {
+    parts.add('implements ${element.interfaces.map(_type).join(', ')}');
+  }
+  return parts.join(' ');
+}
+
+String _typeParameters(TypeParameterizedElement element) {
+  if (element.typeParameters.isEmpty) return '';
+  final rendered = element.typeParameters.map((t) {
+    final bound = t.bound;
+    return bound == null ? t.name! : '${t.name} extends ${_type(bound)}';
+  });
+  return '<${rendered.join(', ')}>';
+}
+
+/// One line per public member [element] itself declares, with its name;
+/// inherited members belong to the supertype's block.
+List<(String, String)> _members(InterfaceElement element) {
+  final byKind = <(int, String, String)>[];
+  void add(int order, String name, String line) =>
+      byKind.add((order, name, line));
+
+  if (element is EnumElement) {
+    for (final constant in element.constants) {
+      add(0, constant.name!, 'value ${constant.name}');
+    }
+  }
+  for (final constructor in element.constructors) {
+    if (constructor.isPrivate || !constructor.isOriginDeclaration) continue;
+    final name = constructor.name == 'new' || constructor.name == null
+        ? element.name!
+        : '${element.name}.${constructor.name}';
+    add(
+      1,
+      name,
+      [
+        'constructor',
+        if (constructor.isConst) 'const',
+        if (constructor.isFactory) 'factory',
+        _parameters(constructor.formalParameters, name),
+        ..._annotations(constructor),
+      ].join(' '),
+    );
+  }
+  for (final field in element.fields) {
+    if (field.isPrivate || !field.isOriginDeclaration || field.isEnumConstant) {
+      continue;
+    }
+    add(
+      2,
+      field.name!,
+      [
+        'field',
+        if (field.isStatic) 'static',
+        if (field.isConst) 'const' else if (field.isFinal) 'final',
+        if (field.isLate) 'late',
+        _type(field.type),
+        field.name!,
+        ..._annotations(field),
+      ].join(' '),
+    );
+  }
+  for (final getter in element.getters) {
+    if (getter.isPrivate || !getter.isOriginDeclaration) continue;
+    add(
+      3,
+      getter.name!,
+      [
+        'getter',
+        if (getter.isStatic) 'static',
+        _type(getter.returnType),
+        getter.name!,
+        if (getter.isAbstract) 'abstract',
+        ..._annotations(getter),
+      ].join(' '),
+    );
+  }
+  for (final setter in element.setters) {
+    if (setter.isPrivate || !setter.isOriginDeclaration) continue;
+    add(
+      4,
+      setter.name!,
+      [
+        'setter',
+        if (setter.isStatic) 'static',
+        _parameters(setter.formalParameters, setter.name!),
+        if (setter.isAbstract) 'abstract',
+        ..._annotations(setter),
+      ].join(' '),
+    );
+  }
+  for (final method in element.methods) {
+    if (method.isPrivate || !method.isOriginDeclaration) continue;
+    add(
+      5,
+      method.name!,
+      [
+        'method',
+        if (method.isStatic) 'static',
+        _signature(method, method.name!),
+        if (method.isAbstract) 'abstract',
+        ..._annotations(method),
+      ].join(' '),
+    );
+  }
+  byKind.sort((a, b) {
+    final byOrder = a.$1.compareTo(b.$1);
+    return byOrder != 0 ? byOrder : a.$2.compareTo(b.$2);
+  });
+  return [for (final m in byKind) (m.$2, m.$3)];
+}
+
+/// `ReturnType name<T>(params)`.
+String _signature(ExecutableElement element, String name) =>
+    '${_type(element.returnType)} '
+    '${_parameters(element.formalParameters, '$name${_typeParameters(element)}')}';
+
+/// `name(a, [b = 1], {required c, d = 2})` with every parameter's type.
+String _parameters(List<FormalParameterElement> parameters, String name) {
+  final positional = <String>[];
+  final optional = <String>[];
+  final named = <String>[];
+  for (final p in parameters) {
+    final defaultValue = p.defaultValueCode;
+    final rendered = [
+      if (p.isRequiredNamed) 'required',
+      _type(p.type),
+      '${p.name}${defaultValue == null ? '' : ' = $defaultValue'}',
+    ].join(' ');
+    if (p.isNamed) {
+      named.add(rendered);
+    } else if (p.isOptionalPositional) {
+      optional.add(rendered);
+    } else {
+      positional.add(rendered);
+    }
+  }
+  return '$name(${[...positional, if (optional.isNotEmpty) '[${optional.join(', ')}]', if (named.isNotEmpty) '{${named.join(', ')}}'].join(', ')})';
+}
+
+/// The annotations an implementer or caller must respect. `@override` is
+/// left out: whether a member overrides is visible in the supertype's block.
+List<String> _annotations(Element element) {
+  final metadata = element.metadata;
+  return [
+    if (metadata.hasNonVirtual) '@nonVirtual',
+    if (metadata.hasProtected) '@protected',
+    if (metadata.hasVisibleForTesting) '@visibleForTesting',
+    if (metadata.hasMustCallSuper) '@mustCallSuper',
+    if (metadata.hasDeprecated) '@Deprecated',
+    if (metadata.hasExperimental) '@experimental',
+  ];
+}
+
+/// A type as written: a typedef stays its name (`EmbeddingTokenizerFactory`,
+/// not the function type it expands to), so swapping the alias for an
+/// identical function type is visible too.
+String _type(DartType type) {
+  final alias = type.alias;
+  if (alias == null) return type.getDisplayString();
+  final arguments = alias.typeArguments;
+  return '${alias.element.name}'
+      '${arguments.isEmpty ? '' : '<${arguments.map(_type).join(', ')}>'}'
+      '${alias.nullabilitySuffix == NullabilitySuffix.question ? '?' : ''}';
+}

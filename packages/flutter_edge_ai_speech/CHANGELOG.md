@@ -1,0 +1,79 @@
+## 0.6.1
+- Whisper/Parakeet log-mel: FFT replaces the direct DFT, ~35x faster; Moonshine unchanged (#784).
+
+## 0.6.0
+- Use litertlm 1.20.0 with LiteRT-LM 0.19 / `native-v0.19.0-a`.
+- Require `flutter_edge_ai` ^2.6.0 and `flutter_edge_ai_litertlm` ^1.20.0.
+
+## 0.5.14
+- Require `flutter_edge_ai` >=2.5.5 <2.6.0 and `flutter_edge_ai_litertlm` >=1.19.1 <1.20.0.
+
+## 0.5.13
+- Model catalog: `LiteRtSpeechModels`, every STT and TTS build pinned to its commit (#734).
+- Speech-to-text requests fp32 on the GPU: moonshine no longer returns NaN on Adreno 740 (#747).
+- Require `flutter_edge_ai` ^2.5.5 and `flutter_edge_ai_litertlm` ^1.19.1.
+
+## 0.5.12
+- Docs: on macOS with Swift Package Manager on, no Podfile block from litertlm 1.19.0 (#689).
+
+## 0.5.11
+- A closed recognizer or synthesizer fails through the returned Future (#718).
+
+## 0.5.10
+- Docs: the macOS app setup STT and TTS need (#689).
+
+## 0.5.9
+- README: which engines default `supportAudio` from the model.
+
+## 0.5.8
+- Docs: after a barge-in, earlier audio turns stay in context with `flutter_edge_ai_litertlm` 1.15.0.
+
+## 0.5.7
+- `VoiceSession.runAudioTurn`: the model hears the recording, no speech-to-text.
+
+## 0.5.6
+- Require `flutter_edge_ai` ^2.3.0 and `flutter_edge_ai_litertlm` ^1.13.0.
+
+## 0.5.5
+- Closing a speech recognizer or synthesizer mid-request no longer leaks its native model.
+
+## 0.5.4
+- Require `flutter_edge_ai` ^2.1.0; README covers TTS from assets, files and bundles.
+
+## 0.5.3
+- Require `flutter_edge_ai` 2.x.
+
+## 0.5.2
+- Renamed from `flutter_gemma_speech`.
+- Inflect TTS: speech was garbled — the encoder now gets the blank tokens it was trained with.
+
+## 0.5.1
+- Windows: STT/TTS failed with `CreateTensorBufferFromHostMemory` status 3 (needs flutter_gemma_litertlm 1.7.0).
+
+## 0.5.0
+- Whisper: output language is a parameter, no longer hardcoded English (#500).
+
+## 0.4.3
+- Add VoiceSession(streamAudio:) — clause-by-clause TTS overlapped with the LLM stream for lower time-to-first-audio.
+
+## 0.4.2
+- Add Inflect-Nano-v2 — fast on-device TTS (~90× real-time on CPU, English-only).
+- VoiceSession.fromChat: optional onToolCall runs function calling in the Voice Loop (via core's generateChatResponseWithTools).
+
+## 0.4.1
+- Add Qwen3-TTS (multilingual AR codec-LM, 11 languages) — 2nd selectable TTS family.
+
+## 0.4.0
+- feat: on-device Whisper-tiny STT (English-only) — log-mel frontend + GPT-2 BPE decode.
+- feat: on-device Parakeet-CTC STT (desktop) — NeMo mel frontend + greedy CTC decode.
+
+## 0.3.0
+- Add VoiceSession — on-device push-to-talk voice loop (STT → LLM → TTS) with barge-in.
+- feat: robust TTS text frontend — punctuation-as-symbols, numbers/acronyms, neural OOV G2P, clause chunking.
+- fix: model-agnostic TTS chunking — word-boundary + duration-aware split so long replies fit MAX_TEXT/MAX_MEL.
+
+## 0.2.0
+- Add on-device TTS (Matcha): installTts/getActiveTts, selectable model, PCM output.
+
+## 0.1.0
+- feat: on-device STT (moonshine-tiny) via `LiteRtSttBackend` + a generic, selectable `SttModelProfile` pipeline (encode → greedy decode → HF detokenize) on the shared LiteRT engine.
